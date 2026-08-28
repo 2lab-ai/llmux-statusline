@@ -51,8 +51,17 @@ The script detects whether the session is routed through an llmux daemon by look
     CDX cyan) and the percentages use its gauge levels on the fleet average (sum/N) of
     remaining — yellow ≤30%, red ≤10%, green otherwise.
 
-- **Plain Claude session** (no llmux) → the session's own usage as reported by
-  Claude Code: `5h:12%`.
+- **Plain Claude session** (no llmux) → the session's own windows as reported by
+  Claude Code, in the same remaining terms, with a reset countdown on the 7-day
+  window:
+
+  ```
+  5h: 42% 7d: 55% ↻3d4h
+  ```
+
+  The 5h coupling cap applies here too (`rem5h_eff = min(rem5h, 5 × rem7d)`). The
+  harness currently reports only the 5h and 7d windows; a fable weekly window is
+  shown automatically if it ever appears in the payload.
 
 The llmux path is strictly best-effort: no llmux binary, daemon down, a non-llmux
 `ANTHROPIC_BASE_URL`, or a port mismatch all silently fall back to the plain `5h:NN%`

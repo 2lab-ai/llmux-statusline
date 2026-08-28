@@ -47,7 +47,18 @@ expect_contains "codex coupling fixture" "$out" "CDX(1) 7d: 75%"
 #  windows; the expectations above pass only if they are excluded from
 #  sums AND the (N) count)
 
-# 3. No llmux -> silent fallback, no fleet segment, exit 0, empty stderr.
+# 3. Direct mode (no llmux): the session windows in REMAINING terms with the
+#    5h coupling cap and a reset countdown on 7d.
+DIRECT='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":58},"seven_day":{"used_percentage":45,"resets_at":RESETS}}}'
+out=$(echo "${DIRECT/RESETS/$(( $(date +%s) + 274000 ))}" \
+  | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" | sed "$STRIP")
+expect_contains "direct remaining"      "$out" "5h: 42% 7d: 55% "
+expect_contains "direct 7d countdown"   "$out" "↻3d4h"
+COUPLED='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":92}}}'
+out=$(echo "$COUPLED" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" | sed "$STRIP")
+expect_contains "direct 5h coupling cap" "$out" "5h: 40% 7d: 8%"
+
+# 4. No llmux -> silent fallback, no fleet segment, exit 0, empty stderr.
 err=$(mktemp)
 out=$(echo "$INPUT" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" 2>"$err" | sed "$STRIP")
 if [[ "$out" != *CLD* && ! -s "$err" ]]; then echo "ok   no-llmux fallback"; else echo "FAIL no-llmux fallback: $out / stderr=$(cat "$err")"; fail=1; fi

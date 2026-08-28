@@ -233,11 +233,54 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
     fi
   fi
 fi
-# Fallback (no llmux, daemon down, port mismatch, parse failure):
-# the session's own 5h window as reported by Claude Code. Never an error.
+# Fallback (no llmux, daemon down, port mismatch, parse failure): the
+# session's own windows as reported by Claude Code, in REMAINING terms with
+# the same coupling cap (rem5h_eff = min(rem5h, 5*rem7d)). The harness
+# currently reports only five_hour and seven_day; a fable weekly window is
+# picked up automatically if it ever appears. Never an error.
+human_dur() { # $1 = seconds -> "3d4h" / "7h22m" / "45m"
+  awk -v s="$1" 'BEGIN {
+    if (s < 0) s = 0
+    d = int(s / 86400); h = int((s % 86400) / 3600); m = int((s % 3600) / 60)
+    if (d > 0) printf "%dd%dh", d, h
+    else if (h > 0) printf "%dh%dm", h, m
+    else printf "%dm", m
+  }'
+}
 if [ -z "$rate_seg" ]; then
-  five=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
-  [ -n "$five" ] && rate_seg="${DIM}5h:$(printf '%.0f' "$five")%${RESET}"
+  read -r u5 u7 r7at uf <<< "$(echo "$input" | jq -r '
+    .rate_limits // {} |
+    [ (.five_hour.used_percentage // "-"),
+      (.seven_day.used_percentage // "-"),
+      (.seven_day.resets_at // "-"),
+      ((.fable_weekly // .seven_day_fable // .seven_day_opus).used_percentage // "-") ]
+    | join(" ")' 2>/dev/null || true)"
+  rem7=""
+  if [ -n "${u7:-}" ] && [ "$u7" != "-" ]; then
+    rem7=$(awk -v u="$u7" 'BEGIN{ r=100-u; if (r<0) r=0; printf "%d", r }')
+  fi
+  parts=()
+  if [ -n "${u5:-}" ] && [ "$u5" != "-" ]; then
+    rem5=$(awk -v u="$u5" -v r7="${rem7:-100}" 'BEGIN{
+      r=100-u; if (r<0) r=0; cap=5*r7; if (r>cap) r=cap; printf "%d", r }')
+    parts+=("${DIM}5h:${RESET} $(paint "$(pct_color "$rem5" 1)")${rem5}%${RESET}")
+  fi
+  if [ -n "$rem7" ]; then
+    seg7="${DIM}7d:${RESET} $(paint "$(pct_color "$rem7" 1)")${rem7}%${RESET}"
+    if [ "$r7at" != "-" ] && [ -n "$r7at" ]; then
+      now_s=$(date +%s)
+      seg7="${seg7}${DIM} ↻$(human_dur $((r7at - now_s)))${RESET}"
+    fi
+    parts+=("$seg7")
+  fi
+  if [ -n "${uf:-}" ] && [ "$uf" != "-" ]; then
+    remf=$(awk -v u="$uf" -v r7="${rem7:-100}" 'BEGIN{
+      r=100-u; if (r<0) r=0; cap=2*r7; if (r>cap) r=cap; printf "%d", r }')
+    parts+=("${DIM}7df:${RESET} $(paint "$(pct_color "$remf" 1)")${remf}%${RESET}")
+  fi
+  if [ ${#parts[@]} -gt 0 ]; then
+    rate_seg=$(IFS=' '; echo "${parts[*]}")
+  fi
 fi
 
 # --- Assemble one compact line ---
