@@ -8,6 +8,7 @@ cd "$(dirname "$0")"
 
 SCRIPT=../statusline.sh
 STRIP=$'s/\033\\[[0-9;]*m//g'
+REV=$'\033[7m'
 INPUT='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"context_window":{"context_window_size":1000000,"current_usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}'
 fail=0
 
@@ -60,7 +61,6 @@ expect_contains "countdown <1h format" "$out" "↻17m10s"
 a=$(FAKE_NOW=10 run_with_fixture fixture-coupling.json raw)  # bucket 2 -> even -> off
 b=$(FAKE_NOW=15 run_with_fixture fixture-coupling.json raw)  # bucket 3 -> odd  -> on
 c=$(FAKE_NOW=20 run_with_fixture fixture-coupling.json raw)  # bucket 4 -> even -> off
-REV=$'\033[7m'
 if [[ "$b" == *"${REV}"*17m10s* ]] && [[ "$a" != *"${REV}"*17m10s* ]] && [[ "$c" != *"${REV}"*17m10s* ]]; then
   echo "ok   <1h blink follows wall-clock parity"
 else
@@ -81,6 +81,14 @@ expect_contains "direct 7d countdown"   "$out" "↻3d4h"
 COUPLED='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":92}}}'
 out=$(echo "$COUPLED" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" | sed "$STRIP")
 expect_contains "direct 5h coupling cap" "$out" "5h: 40% 7d: 8%"
+
+# 3b. Countdown urgency/blink rules are COMMON to direct mode: <1h reset
+#     renders red and inverts on the odd wall-clock bucket, same as fleet.
+DIRECT3='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"seven_day":{"used_percentage":45,"resets_at":1040}}}'
+out=$(echo "$DIRECT3" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LLMUX_STATUSLINE_NOW=15 bash "$SCRIPT")
+expect_contains "direct blink phase on"  "$out" "${REV}"
+out=$(echo "$DIRECT3" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LLMUX_STATUSLINE_NOW=10 bash "$SCRIPT" | sed "$STRIP")
+expect_contains "direct <1h format"      "$out" "↻17m10s"
 
 # 4. No llmux -> silent fallback, no fleet segment, exit 0, empty stderr.
 err=$(mktemp)

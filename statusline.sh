@@ -301,7 +301,8 @@ if [ -z "$rate_seg" ]; then
   if [ -n "$rem7" ]; then
     seg7="${DIM}7d:${RESET} $(paint "$(pct_color "$rem7" 1)")${rem7}%${RESET}"
     if [ "$r7at" != "-" ] && [ -n "$r7at" ]; then
-      seg7="${seg7}${DIM} ↻$(human_dur $((r7at - NOW_S)))${RESET}"
+      # same urgency/blink rules as the fleet segment — common to both modes
+      seg7="${seg7}$(reset_span $((r7at - NOW_S)))"
     fi
     parts+=("$seg7")
   fi

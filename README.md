@@ -64,7 +64,8 @@ The script detects whether the session is routed through an llmux daemon by look
   5h: 42% 7d: 55% ↻3d4h
   ```
 
-  The 5h coupling cap applies here too (`rem5h_eff = min(rem5h, 5 × rem7d)`). The
+  The 5h coupling cap and the countdown urgency/blink tiers are the same in both
+  modes. The cap applies here too (`rem5h_eff = min(rem5h, 5 × rem7d)`). The
   harness currently reports only the 5h and 7d windows; a fable weekly window is
   shown automatically if it ever appears in the payload.
 
