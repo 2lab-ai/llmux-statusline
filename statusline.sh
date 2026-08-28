@@ -185,15 +185,30 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
     fleet_json=$("$LLMUX_BIN" status --json --remote "$target" 2>/dev/null || true)
   fi
   if [ -n "$fleet_json" ]; then
+    # Effective usage per claude account — windows are coupled:
+    #   a full 5h window costs 20% of 7d  => usable 5h capacity = min(rem5h, 5 * rem7d)
+    #   a full 7df window costs 50% of 7d => usable 7df capacity = min(rem7df, 2 * rem7d)
+    # A 7d-exhausted account therefore counts as 100% used on 5h and 7df,
+    # whatever its own window says. Sums are of these effective values.
     read -r cl_n cl5 cl7 clf cx_n cx7 <<< "$(echo "$fleet_json" | jq -r '
+      def c01: if . < 0 then 0 elif . > 1 then 1 else . end;
       [.accounts[] | select(.group == "claude")] as $cl
       | [.accounts[] | select(.group == "codex")] as $cx
+      | [ $cl[]
+          | ((.seven_day.utilization    // 0) | c01) as $u7
+          | ((.five_hour.utilization    // 0) | c01) as $u5
+          | ((.fable_weekly.utilization // 0) | c01) as $uf
+          | (1 - $u7) as $r7
+          | { e5: ((1 - ([ (1 - $u5), (5 * $r7) ] | min)) * 100),
+              e7: ($u7 * 100),
+              ef: ((1 - ([ (1 - $uf), (2 * $r7) ] | min)) * 100) }
+        ] as $eff
       | [ ($cl | length),
-          (([$cl[].five_hour.utilization]   | map(. // 0) | add // 0) * 100 | round),
-          (([$cl[].seven_day.utilization]   | map(. // 0) | add // 0) * 100 | round),
-          (([$cl[].fable_weekly.utilization] | map(. // 0) | add // 0) * 100 | round),
+          ([$eff[].e5] | add // 0 | round),
+          ([$eff[].e7] | add // 0 | round),
+          ([$eff[].ef] | add // 0 | round),
           ($cx | length),
-          (([$cx[].seven_day.utilization]   | map(. // 0) | add // 0) * 100 | round) ]
+          (([$cx[].seven_day.utilization] | map(. // 0) | add // 0) * 100 | round) ]
       | join(" ")' 2>/dev/null || true)"
     if [ -n "${cl_n:-}" ]; then
       if [ "$cl_n" -gt 0 ] 2>/dev/null; then
