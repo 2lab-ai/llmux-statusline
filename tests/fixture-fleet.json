@@ -1,0 +1,9 @@
+{
+  "port": 3456,
+  "accounts": [
+    {"group":"claude","name":"claude:a@x","five_hour":{"utilization":0.5},"seven_day":{"utilization":0.5},"fable_weekly":{"utilization":0.5}},
+    {"group":"claude","name":"claude:b@x","five_hour":{"utilization":0.5},"seven_day":{"utilization":0.5},"fable_weekly":{"utilization":0.5}},
+    {"group":"claude","name":"claude:c@x","five_hour":{"utilization":0.5},"seven_day":{"utilization":0.5},"fable_weekly":{"utilization":0.5}},
+    {"group":"codex","name":"codex:d@x","seven_day":{"utilization":0.04}}
+  ]
+}
