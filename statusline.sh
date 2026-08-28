@@ -26,6 +26,7 @@ fi
 DIM=$'\033[2m'
 RESET=$'\033[0m'
 CYAN=$'\033[36m'
+MAGENTA=$'\033[35m'
 BLUE=$'\033[34m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
@@ -142,11 +143,13 @@ fi
 # --- Rate limits (rightmost): llmux fleet sums when routed through llmux,
 # --- else the session's own 5h usage ---
 
-# pct_color <remaining-sum> <n>: color by average remaining across n accounts
+# pct_color <remaining-sum> <n>: color by average remaining across n accounts.
+# Same levels as the llmux TUI gauges (format.rs GAUGE_YELLOW_AT=0.70,
+# GAUGE_RED_AT=0.90, inverted to remaining): rem<=10 red, rem<=30 yellow.
 pct_color() {
   awk -v s="$1" -v n="$2" 'BEGIN {
     avg = (n > 0) ? s / n : 0
-    if (avg < 10) print "red"; else if (avg < 30) print "yellow"; else print "green"
+    if (avg <= 10) print "red"; else if (avg <= 30) print "yellow"; else print "green"
   }'
 }
 paint() { # paint <color-name>
@@ -220,7 +223,7 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
         c5=$(paint "$(pct_color "$cl5" "$cl_n")")
         c7=$(paint "$(pct_color "$cl7" "$cl_n")")
         cf=$(paint "$(pct_color "$clf" "$cl_n")")
-        rate_seg="${CYAN}CLD(${cl_n})${RESET} ${DIM}5h:${RESET} ${c5}${cl5}%${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}"
+        rate_seg="${MAGENTA}CLD(${cl_n})${RESET} ${DIM}5h:${RESET} ${c5}${cl5}%${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}"
       fi
       if [ "$cx_n" -gt 0 ] 2>/dev/null; then
         x7=$(paint "$(pct_color "$cx7" "$cx_n")")

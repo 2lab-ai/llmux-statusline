@@ -47,8 +47,9 @@ The script detects whether the session is routed through an llmux daemon by look
   - **auth-failed** and operator-**paused** accounts serve nothing and are excluded from
     both the sums and the `(N)` count.
   - `CDX(2)` — codex accounts, 7-day window only.
-  - Colors follow the fleet average (sum/N) of remaining: green ≥30%, yellow <30%,
-    red <10%.
+  - Colors mirror the llmux TUI: group labels use llmux's group colors (CLD magenta,
+    CDX cyan) and the percentages use its gauge levels on the fleet average (sum/N) of
+    remaining — yellow ≤30%, red ≤10%, green otherwise.
 
 - **Plain Claude session** (no llmux) → the session's own usage as reported by
   Claude Code: `5h:12%`.
