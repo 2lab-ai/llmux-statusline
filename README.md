@@ -4,7 +4,7 @@ A single-file Claude Code statusline with [llmux](https://github.com/2lab-ai/llm
 awareness.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/2lab-ai/llmux-statusline/main/install.sh | bash
+curl -fsSL https://2lab-ai.github.io/llmux-statusline/install.sh | bash
 ```
 
 One compact line:
@@ -50,7 +50,7 @@ display — never an error in the statusline.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/2lab-ai/llmux-statusline/main/install.sh | bash
+curl -fsSL https://2lab-ai.github.io/llmux-statusline/install.sh | bash
 ```
 
 Works on macOS, Linux, and WSL. `jq` is auto-installed when a package manager is
