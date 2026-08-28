@@ -41,10 +41,15 @@ model_seg="${CYAN}${model}${RESET}"
 [ -n "$effort" ] && model_seg="${model_seg} ${DIM}${effort}${RESET}"
 [ "$fast" = "true" ] && model_seg="${model_seg} ${YELLOW}fast${RESET}"
 
-# --- Context window: used % (colored) + remaining tokens in k/M ---
-used=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-remaining=$(echo "$input" | jq -r '.context_window.remaining_percentage // empty')
+# --- Context window: used % (colored) + exact remaining tokens in k/M ---
+# Token math is done from current_usage (input+output+cache) rather than the
+# integer-rounded remaining_percentage, which is off by up to ~1% of the window.
 win_size=$(echo "$input" | jq -r '.context_window.context_window_size // empty')
+usage_sum=$(echo "$input" | jq -r '
+  .context_window.current_usage // empty
+  | [.input_tokens, .output_tokens, .cache_creation_input_tokens, .cache_read_input_tokens]
+  | map(. // 0) | add')
+used_pct_reported=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
 
 human_k() {
   awk -v n="$1" 'BEGIN {
@@ -54,8 +59,20 @@ human_k() {
   }'
 }
 
-if [ -n "$used" ]; then
-  used_pct=$(printf '%.0f' "$used")
+ctx=""
+if [ -n "$win_size" ] && [ "$win_size" != "0" ] && [ -n "$usage_sum" ]; then
+  read -r used_pct rem_pct rem_tokens <<< "$(awk -v w="$win_size" -v u="$usage_sum" 'BEGIN {
+    if (u > w) u = w
+    up = 100 * u / w
+    printf "%d %d %d", (up == int(up)) ? up : int(up) + 1, int(100 - up), w - u
+  }')"
+elif [ -n "$used_pct_reported" ]; then
+  # Older payloads without current_usage: fall back to reported percentages
+  used_pct=$(printf '%.0f' "$used_pct_reported")
+  rem_pct=$((100 - used_pct))
+  rem_tokens=""
+fi
+if [ -n "${used_pct:-}" ]; then
   if [ "$used_pct" -ge 90 ]; then
     ctx_color="$RED"
   elif [ "$used_pct" -ge 70 ]; then
@@ -63,10 +80,8 @@ if [ -n "$used" ]; then
   else
     ctx_color="$GREEN"
   fi
-  rem_pct=$(printf '%.0f' "${remaining:-0}")
   ctx="${ctx_color}ctx ${rem_pct}% left${RESET}"
-  if [ -n "$win_size" ] && [ "$win_size" != "0" ]; then
-    rem_tokens=$(awk -v w="$win_size" -v r="${remaining:-0}" 'BEGIN{printf "%d", w*r/100}')
+  if [ -n "$rem_tokens" ] && [ -n "$win_size" ]; then
     ctx="${ctx}${DIM} $(human_k "$rem_tokens")/$(human_k "$win_size")${RESET}"
   fi
 else
