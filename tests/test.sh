@@ -43,6 +43,10 @@ out=$(run_with_fixture fixture-coupling.json)
 expect_contains "coupling caps + cold" "$out" "CLD(3) 5h: 150% 7d: 110% 7df: 120%"
 expect_contains "codex coupling fixture" "$out" "CDX(1) 7d: 75%"
 
+# (both fixtures also carry auth_failed and paused accounts with fresh
+#  windows; the expectations above pass only if they are excluded from
+#  sums AND the (N) count)
+
 # 3. No llmux -> silent fallback, no fleet segment, exit 0, empty stderr.
 err=$(mktemp)
 out=$(echo "$INPUT" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" 2>"$err" | sed "$STRIP")

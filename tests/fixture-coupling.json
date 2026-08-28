@@ -1,9 +1,84 @@
 {
-  "port": 3456,
-  "accounts": [
-    {"group":"claude","name":"claude:exhausted@x","five_hour":{"utilization":0.0},"seven_day":{"utilization":1.0},"fable_weekly":{"utilization":0.0}},
-    {"group":"claude","name":"claude:tight7d@x","five_hour":{"utilization":0.1},"seven_day":{"utilization":0.9},"fable_weekly":{"utilization":0.0}},
-    {"group":"claude","name":"claude:cold@x","five_hour":null,"seven_day":null,"fable_weekly":null},
-    {"group":"codex","name":"codex:cx@x","seven_day":{"utilization":0.25}}
-  ]
+ "port": 3456,
+ "accounts": [
+  {
+   "group": "claude",
+   "name": "claude:exhausted@x",
+   "five_hour": {
+    "utilization": 0.0
+   },
+   "seven_day": {
+    "utilization": 1.0
+   },
+   "fable_weekly": {
+    "utilization": 0.0
+   }
+  },
+  {
+   "group": "claude",
+   "name": "claude:tight7d@x",
+   "five_hour": {
+    "utilization": 0.1
+   },
+   "seven_day": {
+    "utilization": 0.9
+   },
+   "fable_weekly": {
+    "utilization": 0.0
+   }
+  },
+  {
+   "group": "claude",
+   "name": "claude:cold@x",
+   "five_hour": null,
+   "seven_day": null,
+   "fable_weekly": null
+  },
+  {
+   "group": "codex",
+   "name": "codex:cx@x",
+   "seven_day": {
+    "utilization": 0.25
+   }
+  },
+  {
+   "group": "claude",
+   "name": "claude:authfail@x",
+   "status": "auth_failed",
+   "blocked": "auth failed",
+   "five_hour": {
+    "utilization": 0.0
+   },
+   "seven_day": {
+    "utilization": 0.37
+   },
+   "fable_weekly": {
+    "utilization": 0.0
+   }
+  },
+  {
+   "group": "claude",
+   "name": "claude:paused@x",
+   "status": "ok",
+   "blocked": "paused",
+   "five_hour": {
+    "utilization": 0.0
+   },
+   "seven_day": {
+    "utilization": 0.0
+   },
+   "fable_weekly": {
+    "utilization": 0.0
+   }
+  },
+  {
+   "group": "codex",
+   "name": "codex:paused@x",
+   "status": "ok",
+   "blocked": "paused",
+   "seven_day": {
+    "utilization": 0.0
+   }
+  }
+ ]
 }

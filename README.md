@@ -44,6 +44,8 @@ The script detects whether the session is routed through an llmux daemon by look
     A 7d-exhausted account contributes 0% on all three windows even when its own 5h
     window looks fresh.
   - A **cold** (never-used) account has no window data yet and counts as 100% remaining.
+  - **auth-failed** and operator-**paused** accounts serve nothing and are excluded from
+    both the sums and the `(N)` count.
   - `CDX(2)` — codex accounts, 7-day window only.
   - Colors follow the fleet average (sum/N) of remaining: green ≥30%, yellow <30%,
     red <10%.

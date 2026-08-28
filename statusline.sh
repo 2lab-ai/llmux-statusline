@@ -191,10 +191,13 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
     #   rem5h_eff  = min(rem5h,  5 * rem7d)
     #   rem7df_eff = min(rem7df, 2 * rem7d)
     # A cold (never-used) account has null windows => 100% remaining.
+    # auth-failed and operator-paused accounts serve nothing: excluded from
+    # both the sums and the (N) count.
     read -r cl_n cl5 cl7 clf cx_n cx7 <<< "$(echo "$fleet_json" | jq -r '
       def c01: if . < 0 then 0 elif . > 1 then 1 else . end;
-      [.accounts[] | select(.group == "claude")] as $cl
-      | [.accounts[] | select(.group == "codex")] as $cx
+      def usable: select(.status != "auth_failed" and .blocked != "paused");
+      [.accounts[] | select(.group == "claude") | usable] as $cl
+      | [.accounts[] | select(.group == "codex") | usable] as $cx
       | [ $cl[]
           | ((.seven_day.utilization    // 0) | c01) as $u7
           | ((.five_hour.utilization    // 0) | c01) as $u5
