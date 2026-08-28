@@ -142,11 +142,11 @@ fi
 # --- Rate limits (rightmost): llmux fleet sums when routed through llmux,
 # --- else the session's own 5h usage ---
 
-# pct_color <sum> <n>: color by average utilization across n accounts
+# pct_color <remaining-sum> <n>: color by average remaining across n accounts
 pct_color() {
   awk -v s="$1" -v n="$2" 'BEGIN {
     avg = (n > 0) ? s / n : 0
-    if (avg >= 90) print "red"; else if (avg >= 70) print "yellow"; else print "green"
+    if (avg < 10) print "red"; else if (avg < 30) print "yellow"; else print "green"
   }'
 }
 paint() { # paint <color-name>
@@ -185,35 +185,32 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
     fleet_json=$("$LLMUX_BIN" status --json --remote "$target" 2>/dev/null || true)
   fi
   if [ -n "$fleet_json" ]; then
-    # Effective usage per claude account — windows are coupled:
-    #   a full 5h window costs 20% of 7d  => usable 5h capacity = min(rem5h, 5 * rem7d)
-    #   a full 7df window costs 50% of 7d => usable 7df capacity = min(rem7df, 2 * rem7d)
-    # A 7d-exhausted account therefore counts as 100% used on 5h and 7df,
-    # whatever its own window says. Sums are of these effective values.
+    # REMAINING capacity per account, summed per group (3 accounts with 50%
+    # left each => 150%). Windows are coupled: a full 5h window costs ~20% of
+    # 7d, a full 7df window ~50% of 7d, so per account
+    #   rem5h_eff  = min(rem5h,  5 * rem7d)
+    #   rem7df_eff = min(rem7df, 2 * rem7d)
+    # A cold (never-used) account has null windows => 100% remaining.
     read -r cl_n cl5 cl7 clf cx_n cx7 <<< "$(echo "$fleet_json" | jq -r '
       def c01: if . < 0 then 0 elif . > 1 then 1 else . end;
       [.accounts[] | select(.group == "claude")] as $cl
       | [.accounts[] | select(.group == "codex")] as $cx
       | [ $cl[]
-          | if .cooldown_until != null then { e5: 100, e7: 100, ef: 100 }
-            else
-              ((.seven_day.utilization    // 0) | c01) as $u7
-              | ((.five_hour.utilization    // 0) | c01) as $u5
-              | ((.fable_weekly.utilization // 0) | c01) as $uf
-              | (1 - $u7) as $r7
-              | { e5: ((1 - ([ (1 - $u5), (5 * $r7) ] | min)) * 100),
-                  e7: ($u7 * 100),
-                  ef: ((1 - ([ (1 - $uf), (2 * $r7) ] | min)) * 100) }
-            end
-        ] as $eff
+          | ((.seven_day.utilization    // 0) | c01) as $u7
+          | ((.five_hour.utilization    // 0) | c01) as $u5
+          | ((.fable_weekly.utilization // 0) | c01) as $uf
+          | (1 - $u7) as $r7
+          | { r5: (([ (1 - $u5), (5 * $r7) ] | min) * 100),
+              r7: ($r7 * 100),
+              rf: (([ (1 - $uf), (2 * $r7) ] | min) * 100) }
+        ] as $rem
       | [ ($cl | length),
-          ([$eff[].e5] | add // 0 | round),
-          ([$eff[].e7] | add // 0 | round),
-          ([$eff[].ef] | add // 0 | round),
+          ([$rem[].r5] | add // 0 | round),
+          ([$rem[].r7] | add // 0 | round),
+          ([$rem[].rf] | add // 0 | round),
           ($cx | length),
-          (([$cx[] | if .cooldown_until != null then 1
-                     else ((.seven_day.utilization // 0) | c01) end]
-            | add // 0) * 100 | round) ]
+          (([$cx[] | (1 - ((.seven_day.utilization // 0) | c01)) * 100]
+            | add // 0) | round) ]
       | join(" ")' 2>/dev/null || true)"
     if [ -n "${cl_n:-}" ]; then
       if [ "$cl_n" -gt 0 ] 2>/dev/null; then

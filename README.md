@@ -10,7 +10,7 @@ curl -fsSL https://2lab-ai.github.io/llmux-statusline/install.sh | bash
 One compact line:
 
 ```
-Fable 5 high | ctx 66% left 658k/1.0M | ~/2lab.ai/zbrain | main* ↑5 +313,-120 | CLD(10) 5h: 97% 7d: 781% 7df: 666% | CDX(3) 7d: 54%
+Fable 5 high | ctx 66% left 658k/1.0M | ~/2lab.ai/zbrain | main* ↑5 +313,-120 | CLD(10) 5h: 269% 7d: 212% 7df: 292% | CDX(3) 7d: 243%
 ```
 
 ## Segments
@@ -35,17 +35,18 @@ The script detects whether the session is routed through an llmux daemon by look
   CLD(8) 5h: 375% 7d: 720% 7df: 320% | CDX(2) 7d: 213%
   ```
 
-  - `CLD(8)` — 8 claude accounts; `5h` / `7d` / `7df` (7-day Fable window) are the **sum**
-    across all of them. 3 accounts at 50% each shows 150%. Ceiling = N×100%.
-  - `5h` and `7df` are **effective** usage, not the raw window value — the windows are
-    coupled: a full 5h window costs ~20% of the 7d budget, and a full 7df window costs
-    ~50% of it. So per account, usable 5h capacity is `min(rem5h, 5 × rem7d)` and usable
-    7df capacity is `min(rem7df, 2 × rem7d)`; a 7d-exhausted account counts as 100% used
-    on all three windows even when its own 5h window looks fresh. This keeps the sums
-    honest about how much fleet capacity is actually left.
-  - An account in **cooldown** counts as 100% used on every window while it lasts.
-  - `CDX(2)` — codex accounts, 7-day window only (same cooldown rule).
-  - Colors follow the fleet average (sum/N): green <70%, yellow ≥70%, red ≥90%.
+  - Numbers are **remaining capacity, summed** across accounts: `CLD(8)` = 8 claude
+    accounts; 3 accounts with 50% left each shows 150%. Ceiling = N×100%, 0% = fleet
+    exhausted.
+  - `5h` and `7df` are effective remaining — the windows are coupled: a full 5h window
+    costs ~20% of the 7d budget and a full 7df (Fable weekly) window ~50% of it, so per
+    account `rem5h_eff = min(rem5h, 5 × rem7d)` and `rem7df_eff = min(rem7df, 2 × rem7d)`.
+    A 7d-exhausted account contributes 0% on all three windows even when its own 5h
+    window looks fresh.
+  - A **cold** (never-used) account has no window data yet and counts as 100% remaining.
+  - `CDX(2)` — codex accounts, 7-day window only.
+  - Colors follow the fleet average (sum/N) of remaining: green ≥30%, yellow <30%,
+    red <10%.
 
 - **Plain Claude session** (no llmux) → the session's own usage as reported by
   Claude Code: `5h:12%`.
