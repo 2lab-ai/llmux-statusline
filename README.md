@@ -57,11 +57,11 @@ The script detects whether the session is routed through an llmux daemon by look
     remaining — yellow ≤30%, red ≤10%, green otherwise.
 
 - **Plain Claude session** (no llmux) → the session's own windows as reported by
-  Claude Code, in the same remaining terms, with a reset countdown on the 7-day
-  window:
+  Claude Code, in the same remaining terms, with reset countdowns on both
+  windows:
 
   ```
-  5h: 42% 7d: 55% ↻3d4h
+  5h: 42% ↻2h30m 7d: 55% ↻3d4h
   ```
 
   The 5h coupling cap and the countdown urgency/blink tiers are the same in both

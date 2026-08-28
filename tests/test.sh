@@ -87,6 +87,9 @@ expect_contains "direct 5h coupling cap" "$out" "5h: 40% 7d: 8%"
 DIRECT3='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"seven_day":{"used_percentage":45,"resets_at":1040}}}'
 out=$(echo "$DIRECT3" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LLMUX_STATUSLINE_NOW=15 bash "$SCRIPT")
 expect_contains "direct blink phase on"  "$out" "${REV}"
+DIRECT4='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":58,"resets_at":9010},"seven_day":{"used_percentage":45,"resets_at":100010}}}'
+out=$(echo "$DIRECT4" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LLMUX_STATUSLINE_NOW=10 bash "$SCRIPT" | sed "$STRIP")
+expect_contains "direct 5h countdown" "$out" "5h: 42% ↻2h30m 7d: 55% ↻1d3h"
 out=$(echo "$DIRECT3" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LLMUX_STATUSLINE_NOW=10 bash "$SCRIPT" | sed "$STRIP")
 expect_contains "direct <1h format"      "$out" "↻17m10s"
 

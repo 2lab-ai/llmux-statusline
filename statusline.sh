@@ -281,9 +281,10 @@ fi
 # currently reports only five_hour and seven_day; a fable weekly window is
 # picked up automatically if it ever appears. Never an error.
 if [ -z "$rate_seg" ]; then
-  read -r u5 u7 r7at uf <<< "$(echo "$input" | jq -r '
+  read -r u5 r5at u7 r7at uf <<< "$(echo "$input" | jq -r '
     .rate_limits // {} |
     [ (.five_hour.used_percentage // "-"),
+      (.five_hour.resets_at // "-"),
       (.seven_day.used_percentage // "-"),
       (.seven_day.resets_at // "-"),
       ((.fable_weekly // .seven_day_fable // .seven_day_opus).used_percentage // "-") ]
@@ -296,7 +297,11 @@ if [ -z "$rate_seg" ]; then
   if [ -n "${u5:-}" ] && [ "$u5" != "-" ]; then
     rem5=$(awk -v u="$u5" -v r7="${rem7:-100}" 'BEGIN{
       r=100-u; if (r<0) r=0; cap=5*r7; if (r>cap) r=cap; printf "%d", r }')
-    parts+=("${DIM}5h:${RESET} $(paint "$(pct_color "$rem5" 1)")${rem5}%${RESET}")
+    seg5="${DIM}5h:${RESET} $(paint "$(pct_color "$rem5" 1)")${rem5}%${RESET}"
+    if [ "$r5at" != "-" ] && [ -n "$r5at" ]; then
+      seg5="${seg5}$(reset_span $((r5at - NOW_S)))"
+    fi
+    parts+=("$seg5")
   fi
   if [ -n "$rem7" ]; then
     seg7="${DIM}7d:${RESET} $(paint "$(pct_color "$rem7" 1)")${rem7}%${RESET}"
