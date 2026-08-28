@@ -195,20 +195,25 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
       [.accounts[] | select(.group == "claude")] as $cl
       | [.accounts[] | select(.group == "codex")] as $cx
       | [ $cl[]
-          | ((.seven_day.utilization    // 0) | c01) as $u7
-          | ((.five_hour.utilization    // 0) | c01) as $u5
-          | ((.fable_weekly.utilization // 0) | c01) as $uf
-          | (1 - $u7) as $r7
-          | { e5: ((1 - ([ (1 - $u5), (5 * $r7) ] | min)) * 100),
-              e7: ($u7 * 100),
-              ef: ((1 - ([ (1 - $uf), (2 * $r7) ] | min)) * 100) }
+          | if .cooldown_until != null then { e5: 100, e7: 100, ef: 100 }
+            else
+              ((.seven_day.utilization    // 0) | c01) as $u7
+              | ((.five_hour.utilization    // 0) | c01) as $u5
+              | ((.fable_weekly.utilization // 0) | c01) as $uf
+              | (1 - $u7) as $r7
+              | { e5: ((1 - ([ (1 - $u5), (5 * $r7) ] | min)) * 100),
+                  e7: ($u7 * 100),
+                  ef: ((1 - ([ (1 - $uf), (2 * $r7) ] | min)) * 100) }
+            end
         ] as $eff
       | [ ($cl | length),
           ([$eff[].e5] | add // 0 | round),
           ([$eff[].e7] | add // 0 | round),
           ([$eff[].ef] | add // 0 | round),
           ($cx | length),
-          (([$cx[].seven_day.utilization] | map(. // 0) | add // 0) * 100 | round) ]
+          (([$cx[] | if .cooldown_until != null then 1
+                     else ((.seven_day.utilization // 0) | c01) end]
+            | add // 0) * 100 | round) ]
       | join(" ")' 2>/dev/null || true)"
     if [ -n "${cl_n:-}" ]; then
       if [ "$cl_n" -gt 0 ] 2>/dev/null; then

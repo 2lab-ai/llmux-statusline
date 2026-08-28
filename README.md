@@ -43,7 +43,8 @@ The script detects whether the session is routed through an llmux daemon by look
     7df capacity is `min(rem7df, 2 × rem7d)`; a 7d-exhausted account counts as 100% used
     on all three windows even when its own 5h window looks fresh. This keeps the sums
     honest about how much fleet capacity is actually left.
-  - `CDX(2)` — codex accounts, 7-day window only.
+  - An account in **cooldown** counts as 100% used on every window while it lasts.
+  - `CDX(2)` — codex accounts, 7-day window only (same cooldown rule).
   - Colors follow the fleet average (sum/N): green <70%, yellow ≥70%, red ≥90%.
 
 - **Plain Claude session** (no llmux) → the session's own usage as reported by
