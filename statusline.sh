@@ -158,14 +158,13 @@ human_dur() { # $1 = seconds -> "1d2h" / "7h15m" / "15m10s"
 
 # reset_span <seconds-or-empty> -> styled " ↻<dur>" segment (empty input -> "").
 # Urgency: >=1d dim, <1d bright(bold), <1h red with fg/bg inverted on
-# alternating invocations (blink across statusline refreshes).
-BLINK_STATE="${LLMUX_STATUSLINE_BLINK_STATE:-${TMPDIR:-/tmp}/llmux-statusline.blink}"
+# alternating refreshes. The blink phase is WALL-CLOCK derived ((epoch/5s)
+# bucket parity), not per-call state: many concurrent Claude Code sessions
+# each polling every ~5s all agree on the phase and alternate cleanly,
+# where a shared toggle file would race and flicker erratically.
+NOW_S="${LLMUX_STATUSLINE_NOW:-$(date +%s)}"
 blink_on() {
-  local prev=0
-  [ -f "$BLINK_STATE" ] && prev=$(cat "$BLINK_STATE" 2>/dev/null || echo 0)
-  local next=$(( (prev + 1) % 2 ))
-  echo "$next" > "$BLINK_STATE" 2>/dev/null || true
-  [ "$next" = "1" ]
+  [ $(( (NOW_S / 5) % 2 )) -eq 1 ]
 }
 reset_span() {
   local secs="$1"
@@ -302,8 +301,7 @@ if [ -z "$rate_seg" ]; then
   if [ -n "$rem7" ]; then
     seg7="${DIM}7d:${RESET} $(paint "$(pct_color "$rem7" 1)")${rem7}%${RESET}"
     if [ "$r7at" != "-" ] && [ -n "$r7at" ]; then
-      now_s=$(date +%s)
-      seg7="${seg7}${DIM} ↻$(human_dur $((r7at - now_s)))${RESET}"
+      seg7="${seg7}${DIM} ↻$(human_dur $((r7at - NOW_S)))${RESET}"
     fi
     parts+=("$seg7")
   fi

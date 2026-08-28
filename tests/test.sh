@@ -18,7 +18,7 @@ run_with_fixture() { # $1 fixture file [$2 keep-colors] -> statusline output
   chmod +x "$stub"
   if [ "${2:-}" = "raw" ]; then filter=cat; else filter=(sed "$STRIP"); fi
   echo "$INPUT" | ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$stub" \
-    LLMUX_STATUSLINE_BLINK_STATE="${BLINK_STATE_FILE:-$(mktemp)}" \
+    LLMUX_STATUSLINE_NOW="${FAKE_NOW:-}" \
     bash "$SCRIPT" | "${filter[@]}"
 }
 
@@ -55,16 +55,16 @@ expect_contains "codex countdown"       "$out" "CDX(1) 7d: 96% ↻1d2h"
 out=$(run_with_fixture fixture-coupling.json)
 expect_contains "countdown <1d format + decoy ignored" "$out" "7df: 120% ↻17h10m"
 expect_contains "countdown <1h format" "$out" "↻17m10s"
-BLINK_STATE_FILE=$(mktemp)
-a=$(run_with_fixture fixture-coupling.json raw)
-b=$(run_with_fixture fixture-coupling.json raw)
-unset BLINK_STATE_FILE
+# Blink phase is wall-clock derived ((epoch/5) parity) so 20 concurrent
+# sessions polling every ~5s agree on the phase — no shared mutable state.
+a=$(FAKE_NOW=10 run_with_fixture fixture-coupling.json raw)  # bucket 2 -> even -> off
+b=$(FAKE_NOW=15 run_with_fixture fixture-coupling.json raw)  # bucket 3 -> odd  -> on
+c=$(FAKE_NOW=20 run_with_fixture fixture-coupling.json raw)  # bucket 4 -> even -> off
 REV=$'\033[7m'
-if { [[ "$a" == *"${REV}"*17m10s* ]] && [[ "$b" != *"${REV}"*17m10s* ]]; } || \
-   { [[ "$b" == *"${REV}"*17m10s* ]] && [[ "$a" != *"${REV}"*17m10s* ]]; }; then
-  echo "ok   <1h blink alternates"
+if [[ "$b" == *"${REV}"*17m10s* ]] && [[ "$a" != *"${REV}"*17m10s* ]] && [[ "$c" != *"${REV}"*17m10s* ]]; then
+  echo "ok   <1h blink follows wall-clock parity"
 else
-  echo "FAIL <1h blink alternates"; fail=1
+  echo "FAIL <1h blink follows wall-clock parity"; fail=1
 fi
 
 # (both fixtures also carry auth_failed and paused accounts with fresh
