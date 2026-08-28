@@ -8,7 +8,8 @@
     "utilization": 0.5
    },
    "seven_day": {
-    "utilization": 0.5
+    "utilization": 0.5,
+    "resets_in_secs": 93600
    },
    "fable_weekly": {
     "utilization": 0.5
@@ -21,7 +22,8 @@
     "utilization": 0.5
    },
    "seven_day": {
-    "utilization": 0.5
+    "utilization": 0.5,
+    "resets_in_secs": 93600
    },
    "fable_weekly": {
     "utilization": 0.5
@@ -34,7 +36,8 @@
     "utilization": 0.5
    },
    "seven_day": {
-    "utilization": 0.5
+    "utilization": 0.5,
+    "resets_in_secs": 93600
    },
    "fable_weekly": {
     "utilization": 0.5
@@ -44,7 +47,8 @@
    "group": "codex",
    "name": "codex:d@x",
    "seven_day": {
-    "utilization": 0.04
+    "utilization": 0.04,
+    "resets_in_secs": 93600
    }
   },
   {
@@ -56,7 +60,8 @@
     "utilization": 0.0
    },
    "seven_day": {
-    "utilization": 0.37
+    "utilization": 0.37,
+    "resets_in_secs": 93600
    },
    "fable_weekly": {
     "utilization": 0.0
@@ -71,7 +76,8 @@
     "utilization": 0.0
    },
    "seven_day": {
-    "utilization": 0.0
+    "utilization": 0.0,
+    "resets_in_secs": 93600
    },
    "fable_weekly": {
     "utilization": 0.0

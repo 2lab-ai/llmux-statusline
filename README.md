@@ -47,6 +47,10 @@ The script detects whether the session is routed through an llmux daemon by look
   - **auth-failed** and operator-**paused** accounts serve nothing and are excluded from
     both the sums and the `(N)` count.
   - `CDX(2)` — codex accounts, 7-day window only.
+  - `↻1d2h` after each group = time until the **soonest 7-day reset** among that
+    group's usable accounts. Tiers: `1d2h` (dim), `17h10m` (<1 day, bright),
+    `17m10s` (<1 hour, red — and the text inverts on alternating refreshes as a
+    blink).
   - Colors mirror the llmux TUI: group labels use llmux's group colors (CLD magenta,
     CDX cyan) and the percentages use its gauge levels on the fleet average (sum/N) of
     remaining — yellow ≤30%, red ≤10%, green otherwise.

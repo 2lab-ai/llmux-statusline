@@ -11,13 +11,15 @@ STRIP=$'s/\033\\[[0-9;]*m//g'
 INPUT='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"context_window":{"context_window_size":1000000,"current_usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}'
 fail=0
 
-run_with_fixture() { # $1 fixture file -> statusline output (colors stripped)
-  local stub
+run_with_fixture() { # $1 fixture file [$2 keep-colors] -> statusline output
+  local stub filter
   stub="$(mktemp -d)/llmux"
   printf '#!/bin/bash\ncat "%s"\n' "$PWD/$1" > "$stub"
   chmod +x "$stub"
+  if [ "${2:-}" = "raw" ]; then filter=cat; else filter=(sed "$STRIP"); fi
   echo "$INPUT" | ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$stub" \
-    bash "$SCRIPT" | sed "$STRIP"
+    LLMUX_STATUSLINE_BLINK_STATE="${BLINK_STATE_FILE:-$(mktemp)}" \
+    bash "$SCRIPT" | "${filter[@]}"
 }
 
 expect_contains() { # $1 name, $2 haystack, $3 needle
@@ -42,6 +44,28 @@ expect_contains "codex remaining"    "$out" "CDX(1) 7d: 96%"
 out=$(run_with_fixture fixture-coupling.json)
 expect_contains "coupling caps + cold" "$out" "CLD(3) 5h: 150% 7d: 110% 7df: 120%"
 expect_contains "codex coupling fixture" "$out" "CDX(1) 7d: 75%"
+
+# 2b. Reset countdowns: soonest 7d reset among USABLE accounts per group
+#     (excluded accounts carry a 5s decoy reset that must be ignored),
+#     duration tiers 1d2h / 17h10m / 17m10s, and the <1h red countdown
+#     inverts on alternating invocations.
+out=$(run_with_fixture fixture-fleet.json)
+expect_contains "countdown >=1d format" "$out" "7df: 150% ↻1d2h"
+expect_contains "codex countdown"       "$out" "CDX(1) 7d: 96% ↻1d2h"
+out=$(run_with_fixture fixture-coupling.json)
+expect_contains "countdown <1d format + decoy ignored" "$out" "7df: 120% ↻17h10m"
+expect_contains "countdown <1h format" "$out" "↻17m10s"
+BLINK_STATE_FILE=$(mktemp)
+a=$(run_with_fixture fixture-coupling.json raw)
+b=$(run_with_fixture fixture-coupling.json raw)
+unset BLINK_STATE_FILE
+REV=$'\033[7m'
+if { [[ "$a" == *"${REV}"*17m10s* ]] && [[ "$b" != *"${REV}"*17m10s* ]]; } || \
+   { [[ "$b" == *"${REV}"*17m10s* ]] && [[ "$a" != *"${REV}"*17m10s* ]]; }; then
+  echo "ok   <1h blink alternates"
+else
+  echo "FAIL <1h blink alternates"; fail=1
+fi
 
 # (both fixtures also carry auth_failed and paused accounts with fresh
 #  windows; the expectations above pass only if they are excluded from

@@ -27,6 +27,8 @@ DIM=$'\033[2m'
 RESET=$'\033[0m'
 CYAN=$'\033[36m'
 MAGENTA=$'\033[35m'
+REVERSE=$'\033[7m'
+BOLD=$'\033[1m'
 BLUE=$'\033[34m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
@@ -143,6 +145,45 @@ fi
 # --- Rate limits (rightmost): llmux fleet sums when routed through llmux,
 # --- else the session's own 5h usage ---
 
+human_dur() { # $1 = seconds -> "1d2h" / "7h15m" / "15m10s"
+  awk -v s="$1" 'BEGIN {
+    if (s < 0) s = 0
+    d = int(s / 86400); h = int((s % 86400) / 3600)
+    m = int((s % 3600) / 60); sec = int(s % 60)
+    if (d > 0) printf "%dd%dh", d, h
+    else if (h > 0) printf "%dh%dm", h, m
+    else printf "%dm%ds", m, sec
+  }'
+}
+
+# reset_span <seconds-or-empty> -> styled " ↻<dur>" segment (empty input -> "").
+# Urgency: >=1d dim, <1d bright(bold), <1h red with fg/bg inverted on
+# alternating invocations (blink across statusline refreshes).
+BLINK_STATE="${LLMUX_STATUSLINE_BLINK_STATE:-${TMPDIR:-/tmp}/llmux-statusline.blink}"
+blink_on() {
+  local prev=0
+  [ -f "$BLINK_STATE" ] && prev=$(cat "$BLINK_STATE" 2>/dev/null || echo 0)
+  local next=$(( (prev + 1) % 2 ))
+  echo "$next" > "$BLINK_STATE" 2>/dev/null || true
+  [ "$next" = "1" ]
+}
+reset_span() {
+  local secs="$1"
+  [ -z "$secs" ] || [ "$secs" = "-" ] && return 0
+  local dur; dur=$(human_dur "$secs")
+  if [ "$secs" -lt 3600 ] 2>/dev/null; then
+    if blink_on; then
+      printf ' %s%s↻%s%s' "$RED" "$REVERSE" "$dur" "$RESET"
+    else
+      printf ' %s↻%s%s' "$RED" "$dur" "$RESET"
+    fi
+  elif [ "$secs" -lt 86400 ] 2>/dev/null; then
+    printf ' %s↻%s%s' "$BOLD" "$dur" "$RESET"
+  else
+    printf ' %s↻%s%s' "$DIM" "$dur" "$RESET"
+  fi
+}
+
 # pct_color <remaining-sum> <n>: color by average remaining across n accounts.
 # Same levels as the llmux TUI gauges (format.rs GAUGE_YELLOW_AT=0.70,
 # GAUGE_RED_AT=0.90, inverted to remaining): rem<=10 red, rem<=30 yellow.
@@ -196,7 +237,7 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
     # A cold (never-used) account has null windows => 100% remaining.
     # auth-failed and operator-paused accounts serve nothing: excluded from
     # both the sums and the (N) count.
-    read -r cl_n cl5 cl7 clf cx_n cx7 <<< "$(echo "$fleet_json" | jq -r '
+    read -r cl_n cl5 cl7 clf cl_rs cx_n cx7 cx_rs <<< "$(echo "$fleet_json" | jq -r '
       def c01: if . < 0 then 0 elif . > 1 then 1 else . end;
       def usable: select(.status != "auth_failed" and .blocked != "paused");
       [.accounts[] | select(.group == "claude") | usable] as $cl
@@ -214,20 +255,22 @@ if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
           ([$rem[].r5] | add // 0 | round),
           ([$rem[].r7] | add // 0 | round),
           ([$rem[].rf] | add // 0 | round),
+          (([$cl[].seven_day.resets_in_secs] | map(select(. != null)) | min) // "-"),
           ($cx | length),
           (([$cx[] | (1 - ((.seven_day.utilization // 0) | c01)) * 100]
-            | add // 0) | round) ]
+            | add // 0) | round),
+          (([$cx[].seven_day.resets_in_secs] | map(select(. != null)) | min) // "-") ]
       | join(" ")' 2>/dev/null || true)"
     if [ -n "${cl_n:-}" ]; then
       if [ "$cl_n" -gt 0 ] 2>/dev/null; then
         c5=$(paint "$(pct_color "$cl5" "$cl_n")")
         c7=$(paint "$(pct_color "$cl7" "$cl_n")")
         cf=$(paint "$(pct_color "$clf" "$cl_n")")
-        rate_seg="${MAGENTA}CLD(${cl_n})${RESET} ${DIM}5h:${RESET} ${c5}${cl5}%${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}"
+        rate_seg="${MAGENTA}CLD(${cl_n})${RESET} ${DIM}5h:${RESET} ${c5}${cl5}%${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}$(reset_span "${cl_rs:-}")"
       fi
       if [ "$cx_n" -gt 0 ] 2>/dev/null; then
         x7=$(paint "$(pct_color "$cx7" "$cx_n")")
-        cdx="${CYAN}CDX(${cx_n})${RESET} ${DIM}7d:${RESET} ${x7}${cx7}%${RESET}"
+        cdx="${CYAN}CDX(${cx_n})${RESET} ${DIM}7d:${RESET} ${x7}${cx7}%${RESET}$(reset_span "${cx_rs:-}")"
         if [ -n "$rate_seg" ]; then rate_seg="${rate_seg}${DIM} | ${RESET}${cdx}"; else rate_seg="$cdx"; fi
       fi
     fi
@@ -238,15 +281,6 @@ fi
 # the same coupling cap (rem5h_eff = min(rem5h, 5*rem7d)). The harness
 # currently reports only five_hour and seven_day; a fable weekly window is
 # picked up automatically if it ever appears. Never an error.
-human_dur() { # $1 = seconds -> "3d4h" / "7h22m" / "45m"
-  awk -v s="$1" 'BEGIN {
-    if (s < 0) s = 0
-    d = int(s / 86400); h = int((s % 86400) / 3600); m = int((s % 3600) / 60)
-    if (d > 0) printf "%dd%dh", d, h
-    else if (h > 0) printf "%dh%dm", h, m
-    else printf "%dm", m
-  }'
-}
 if [ -z "$rate_seg" ]; then
   read -r u5 u7 r7at uf <<< "$(echo "$input" | jq -r '
     .rate_limits // {} |
