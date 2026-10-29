@@ -293,17 +293,22 @@ expect_eq       "dangling symlinked lock: target never created" "$([ -e "$GHOST"
 # miss / an unknown-age lock, never opened (a read would block forever).
 CD="$LLMUX_STATUSLINE_CACHE_DIR/fifo"
 WD="$(mktemp -d)"
-bounded() { # $1 = NOW: run_cached, killed after 10 s -> its output or "HUNG"
+bounded() { # $1 = NOW: one run, killed after 10 s -> its stripped line or "HUNG"
   local pid n=0
-  run_cached "$1" > "$WD/out" & pid=$!
+  echo "$INPUT" > "$WD/in"
+  # the statusline itself is the background child, every fd on a file, so a
+  # hung run is killed directly and leaves nothing holding the test's pipes
+  ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$STUB" LLMUX_STATUSLINE_NOW="$1" \
+    LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" < "$WD/in" > "$WD/out" 2> "$WD/err" &
+  pid=$!
   while kill -0 "$pid" 2>/dev/null && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
   if kill -0 "$pid" 2>/dev/null; then
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
-    for p in "$CD"/*; do [ -p "$p" ] && { : <> "$p"; } 2>/dev/null; done # unblock a stuck reader
     echo HUNG; return 0
   fi
   wait "$pid" 2>/dev/null || true
-  cat "$WD/out"
+  sed "$STRIP" "$WD/out"
+  if [ -s "$WD/err" ]; then echo "STDERR: $(cat "$WD/err")"; fi
 }
 run_cached 8000 >/dev/null; f=$(fleet_file)
 rm -f "$f"; mkfifo "$f"
