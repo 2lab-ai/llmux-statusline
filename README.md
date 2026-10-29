@@ -121,8 +121,11 @@ the others reuse it. The git segment can therefore lag the working tree by up to
 the TTL. While another session is refreshing, an expired entry may be shown for
 up to TTL + 30 s, after which a session computes the value itself. The llmux
 countdowns are aged from the moment llmux answered, so they stay accurate to
-about a second. The cache is used only in a directory owned by you (created
-mode 700); a missing, foreign or symlinked directory just turns it off.
+about a second. The cache is used only in a directory owned by you; a foreign
+or symlinked directory just turns it off. The default directory is created
+mode 700. If you point `LLMUX_STATUSLINE_CACHE_DIR` somewhere else, make that
+directory private yourself (`chmod 700`, owned by you, no ACLs granting others
+write): the script cannot check its mode or ACLs without starting a process.
 
 Remote daemons work out of the box: when `ANTHROPIC_BASE_URL` points at a non-local host,
 the script queries it via `llmux status --json --remote host:port`.
