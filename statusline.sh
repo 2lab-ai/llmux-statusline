@@ -121,7 +121,7 @@ fi
 # exactly as awk did ("?" = an input awk would coerce; the script then runs
 # that awk itself).
 JQ_STDIN='
-def s: (if type == "string" then . else tojson end) | gsub("\u0000"; "");
+def s: (if type == "string" then . else tojson end) | split("\u0000") | join("");
 def rs: if endswith("\n") then .[:-1] | rs else . end;
 def f(e): [e | s] | join("\n") | rs;
 def h: try (reduce explode[] as $c (5381; (. * 33 + $c) % 4294967296) | tostring) catch "";
@@ -178,16 +178,29 @@ now_s() { # -> NOW_T = wall clock now, no fork (+-1 s)
 }
 
 # --- Shared cache ----------------------------------------------------------
+# INVARIANT (the contract every change here must keep):
+#   1. A published entry is always complete.
+#   2. Its timestamp truthfully records when its data was read.
+#   3. A value is never shown once its age is >= TTL + LOCK_STALE.
+# The refresh lock is advisory: it only spares duplicate refreshes. The
+# windows between an owner/age check and the mv/rm that follows are accepted:
+# their only possible effects are a duplicate refresh or, briefly, an older
+# but truthfully stamped entry replacing a newer one.
+#
 # One entry file per key: ts, magic, key, A, B, "end", one per line. Every
-# refresher writes its own staging file and publishes it with one `mv`
-# (atomic rename), so a reader sees a complete old entry or a complete new
-# one; anything that does not parse is a miss. The refresh lock (<entry>.lock,
-# a directory holding the owner's token) is advisory: it only spares
-# duplicate refreshes, and nothing breaks if two runs refresh at once.
-# The cache is used only in a real directory owned by this user.
+# computing run writes its own staging file and publishes it with one `mv`
+# (atomic rename) when it holds the lock or its data is newer than what is
+# there (newest data wins). Only regular files are read; anything else, or
+# anything that does not parse, is a miss. The lock (<entry>.lock) is a
+# directory holding the owner's token "<ts>.<pid>.<random>". The cache is used
+# only in a real directory owned by this user. Ages are taken at the moment
+# of each decision (now_s), not at script start.
+is_file() { [ -f "$1" ] && [ ! -L "$1" ]; } # never open a FIFO, device or symlink
+
 cache_get() { # <file> <magic> <key> -> C_TS C_A C_B; 0 = well-formed entry
   local m k e
   C_TS=""; C_A=""; C_B=""
+  is_file "$1" || return 1
   {
     IFS= read -r C_TS; IFS= read -r m; IFS= read -r k
     IFS= read -r C_A; IFS= read -r C_B; IFS= read -r e
@@ -195,25 +208,30 @@ cache_get() { # <file> <magic> <key> -> C_TS C_A C_B; 0 = well-formed entry
   [ "$m" = "$2" ] && [ "$k" = "$3" ] && [ "$e" = "end" ] && is_int "$C_TS"
 }
 
-TOKEN="$NOW_S.$$.$RANDOM" # this run's lock owner token: "<ts>.<pid>.<random>"
+TOKEN="" # owner token of the lock this run took last
+
+lock_token() { # <lockdir> -> TOK = its owner token ("" = none / unreadable)
+  TOK=""
+  is_file "$1/owner" || return 0
+  { IFS= read -r TOK < "$1/owner"; } 2>/dev/null
+}
 
 lock_owned() { # <lockdir>: 0 = the lock exists and holds this run's token
-  local tok=""
-  [ -d "$1" ] && [ ! -L "$1" ] || return 1
-  { IFS= read -r tok < "$1/owner"; } 2>/dev/null
-  [ "$tok" = "$TOKEN" ]
+  [ -n "$TOKEN" ] && [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  lock_token "$1"
+  [ "$TOK" = "$TOKEN" ]
 }
 
 lock_take() { # <lockdir> <entry age, "" = no entry>: 0 = this run holds the lock
-  local lk="$1" tok="" lts
+  local lk="$1" lts
   [ -L "$lk" ] && return 1 # never act on a symlink
   if [ -e "$lk" ]; then
     [ -d "$lk" ] && [ -O "$lk" ] || return 1 # not a lock of ours: leave it alone
-    { IFS= read -r tok < "$lk/owner"; } 2>/dev/null
-    lts="${tok%%.*}"
+    lock_token "$lk"
+    lts="${TOK%%.*}"
     if is_int "$lts"; then
       # the holder's token: live until LOCK_STALE old
-      [ $((NOW_S - lts)) -lt "$LOCK_STALE" ] && [ $((lts - NOW_S)) -le 5 ] && return 1
+      [ $((NOW_T - lts)) -lt "$LOCK_STALE" ] && [ $((lts - NOW_T)) -le 5 ] && return 1
     else
       # no token (its holder sits between mkdir and the token write, or died
       # there): age unknown, so it is broken only once the entry has gone
@@ -223,21 +241,40 @@ lock_take() { # <lockdir> <entry age, "" = no entry>: 0 = this run holds the loc
     rm -rf "$lk" 2>/dev/null # a dead holder's lock: break it, retry once
   fi
   mkdir -m 700 "$lk" 2>/dev/null || return 1
+  TOKEN="$NOW_T.$$.$RANDOM"
   set -C
   { printf '%s\n' "$TOKEN" > "$lk/owner"; } 2>/dev/null
   set +C
   return 0
 }
 
+# publish <file> <lockdir> <magic> <key>: C_TS_NEW/C_A/C_B as an entry, via
+# this run's own staging file, if this run holds the lock or the entry there
+# is missing, invalid, stamped from the future, or older than C_TS_NEW.
+publish() {
+  ( umask 077
+    stage="$1.tmp.$$.$RANDOM"
+    { [ -e "$stage" ] || [ -L "$stage" ]; } && exit 1
+    set -C
+    printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$C_TS_NEW" "$3" "$4" "$C_A" "$C_B" end > "$stage" || exit 1
+    now_s
+    if lock_owned "$2" || ! cache_get "$1" "$3" "$4" ||
+       [ "$C_TS" -lt "$C_TS_NEW" ] || [ "$C_TS" -gt $((NOW_T + 5)) ]; then
+      exec mv -f "$stage" "$1"
+    fi
+    exec rm -f "$stage" # a newer entry is there already
+  ) 2>/dev/null
+}
+
 # cached <name> <key> <hash> <compute-fn>: C_A/C_B from a fresh entry, else
-# from <compute-fn>, published when this run holds the refresh lock. While
-# another run holds it, a stale entry is served, but only while it is younger
-# than TTL + LOCK_STALE; past that this run computes inline. C_AGE = age in
-# seconds of what is served. <compute-fn> may set C_TS_NEW (default NOW_S),
-# the time its data was sampled.
+# from <compute-fn>. While another run holds the lock, a stale entry is
+# served, but only while it is younger than TTL + LOCK_STALE; past that this
+# run computes inline. C_AGE = age in seconds of what is served.
+# <compute-fn> sets C_TS_NEW to when its data was read (default: now).
 cached() {
   local file="$CACHE_DIR/$1-$3" magic="llmux-statusline-$1-v1" key="$2" fn="$4" lk age=""
-  C_AGE=0; C_TS_NEW="$NOW_S"
+  now_s
+  C_AGE=0; C_TS_NEW="$NOW_T"
   if [ "$CACHE_TTL" -eq 0 ] || [ -z "$3" ]; then "$fn"; return 0; fi
   if [ ! -e "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; then
     ( umask 077; exec mkdir -p "$CACHE_DIR" ) 2>/dev/null
@@ -246,7 +283,7 @@ cached() {
     "$fn"; return 0
   fi
   if cache_get "$file" "$magic" "$key"; then
-    age=$((NOW_S - C_TS))
+    age=$((NOW_T - C_TS))
     # stamped up to 5 s ahead: clock granularity between concurrent runs
     [ "$age" -lt 0 ] && [ "$age" -ge -5 ] && age=0
     if [ "$age" -ge 0 ]; then
@@ -260,20 +297,14 @@ cached() {
   if lock_take "$lk" "$age"; then
     C_AGE=0
     "$fn"
-    # publish: own staging file (O_EXCL create), ownership re-checked, mv
-    ( umask 077
-      stage="$file.tmp.$$.$RANDOM"
-      set -C
-      printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$C_TS_NEW" "$magic" "$key" "$C_A" "$C_B" end > "$stage" || exit 1
-      lock_owned "$lk" && exec mv -f "$stage" "$file"
-      exec rm -f "$stage" # the lock was taken over meanwhile: its holder publishes
-    ) 2>/dev/null
+    publish "$file" "$lk" "$magic" "$key"
     lock_owned "$lk" && rm -rf "$lk" 2>/dev/null
     return 0
   fi
   [ -n "$age" ] && [ "$age" -lt $((CACHE_TTL + LOCK_STALE)) ] && return 0 # stale, bounded
   C_AGE=0
   "$fn"
+  publish "$file" "$lk" "$magic" "$key" # newest data wins
 }
 
 # --- Model (+ effort level + fast mode): e.g. "Fable 5 high" / "sol[1m] max fast" ---
@@ -417,6 +448,10 @@ git_seg="$C_A"
 # --- Rate limits (rightmost): llmux fleet sums when routed through llmux,
 # --- else the session's own 5h usage ---
 
+# Clock for this segment (blink phase, payload countdowns): read after the
+# git work, as the original script's `date` call was.
+now_s; NOW_R=$NOW_T
+
 human_dur() { # $1 = seconds -> HD ("1d2h" / "7h15m" / "15m10s")
   local s="$1"
   if is_int "$s"; then
@@ -452,7 +487,7 @@ reset_span() {
   { [ -z "$secs" ] || [ "$secs" = "-" ]; } && return 0
   human_dur "$secs"
   if [ "$secs" -lt 3600 ] 2>/dev/null; then
-    if [ $(((NOW_S / 5) % 2)) -eq 1 ]; then
+    if [ $(((NOW_R / 5) % 2)) -eq 1 ]; then
       RS=" ${RED}${REVERSE}↻${HD}${RESET}"
     else
       RS=" ${RED}↻${HD}${RESET}"
@@ -468,9 +503,9 @@ reset_span() {
 reset_at_span() {
   local at="$1"
   if is_int "$at"; then
-    reset_span $((at - NOW_S))
+    reset_span $((at - NOW_R))
   else
-    RS=$(reset_span $((at - NOW_S)); printf '%s' "$RS")
+    RS=$(reset_span $((at - NOW_R)); printf '%s' "$RS")
   fi
 }
 
@@ -506,7 +541,7 @@ pct_paint() {
 # both the sums and the (N) count.
 # Output: "<daemon port>\037cl_n cl5 cl7 clf cl_rs cx_n cx7 cx_rs".
 JQ_FLEET='
-def s: (if type == "string" then . else tojson end) | gsub("\u0000"; "");
+def s: (if type == "string" then . else tojson end) | split("\u0000") | join("");
 def c01: if . < 0 then 0 elif . > 1 then 1 else . end;
 def usable: select(.status != "auth_failed" and .blocked != "paused");
 (try ([.port // empty | s] | join("\n")) catch "")

@@ -178,11 +178,11 @@ before=$(calls)
 out=$(run_cached 1130)
 expect_eq       "unremovable lock + entry 100 s old: computed inline" "$(calls)" $((before + 1))
 expect_contains "unremovable lock + entry 100 s old: fresh value" "$out" "CDX(1) 7d: 75% ↻17m10s"
-expect_eq       "unremovable lock: no publish without the lock" "$(head -n 1 "$f")" 1030
+expect_eq       "unremovable lock: inline result published (newest data wins)" "$(head -n 1 "$f")" 1130
 chmod 755 "$f.lock"; rm -rf "$f.lock"
 printf 'junk\n' > "$f.lock"; chmod 444 "$f.lock" # not a lock dir of ours
 before=$(calls)
-out=$(run_cached 1130)
+out=$(run_cached 1230)
 expect_eq       "read-only junk lock file + entry 100 s old: computed inline" "$(calls)" $((before + 1))
 expect_contains "read-only junk lock file: fresh value" "$out" "CDX(1) 7d: 75% ↻17m10s"
 expect_eq       "read-only junk lock file: left untouched" "$(cat "$f.lock")" junk
@@ -208,21 +208,34 @@ FAST_STUB="$STUB"; STUB="$BSTUB"
 CD="$LLMUX_STATUSLINE_CACHE_DIR/interleave"
 : > "$SIG/go"; run_cached 1000 >/dev/null; f=$(fleet_file)
 
-# (a) Lock stolen before publish (a breaker took it over): no publish.
+stamp() { sed "1s/.*/$1/" "$f" > "$f.t" && mv "$f.t" "$f"; } # entry with data read at $1
+
+# (a) Superseded refresher whose data is OLDER than the entry now there: its
+#     lock was broken, the new holder published data read later. Dropped.
 bg_refresh 1015
 held=$(cat "$f.lock/owner")
-lock_as 1015.1.1
+lock_as 1020.1.1
+stamp 1020
 : > "$SIG/go"; wait "$BG_PID"
 expect_eq       "refresher held the lock while blocked" "${held%%.*}" 1015
-expect_eq       "lock stolen before publish: entry not republished" "$(head -n 1 "$f")" 1000
-expect_eq       "lock stolen before publish: staging file dropped" "$(ls "$CD" | grep -c '\.tmp\.')" 0
-expect_eq       "lock stolen before publish: thief's lock left alone" "$(cat "$f.lock/owner")" 1015.1.1
-expect_contains "lock stolen before publish: the run still shows its fresh value" "$(sed "$STRIP" "$SIG/out")" "CDX(1) 7d: 75% ↻17m10s"
-expect_eq       "lock stolen before publish: no stderr" "$(cat "$SIG/err")" ""
+expect_eq       "late publisher with older data: newer entry kept" "$(head -n 1 "$f")" 1020
+expect_eq       "late publisher with older data: staging file dropped" "$(ls "$CD" | grep -c '\.tmp\.')" 0
+expect_eq       "late publisher: the new holder's lock left alone" "$(cat "$f.lock/owner")" 1020.1.1
+expect_contains "late publisher: the run still shows its own fresh value" "$(sed "$STRIP" "$SIG/out")" "CDX(1) 7d: 75% ↻17m10s"
+expect_eq       "late publisher: no stderr" "$(cat "$SIG/err")" ""
 
-# (b) Lock with no token yet (its creator between mkdir and the token write):
-#     not taken over until the entry is TTL + LOCK_STALE old.
-rm -rf "$f.lock"; mkdir "$f.lock"
+# (b) Superseded refresher whose data is NEWER than the entry: publishes.
+rm -rf "$f.lock"; stamp 1000
+bg_refresh 1015
+lock_as 1015.1.1
+: > "$SIG/go"; wait "$BG_PID"
+expect_eq       "superseded publisher with newer data: published" "$(head -n 1 "$f"),$(tail -n 1 "$f")" "1015,end"
+expect_eq       "superseded publisher: staging file gone" "$(ls "$CD" | grep -c '\.tmp\.')" 0
+expect_eq       "superseded publisher: the other holder's lock left alone" "$(cat "$f.lock/owner")" 1015.1.1
+
+# (b2) Lock with no token yet (its creator between mkdir and the token
+#      write): not taken over until the entry is TTL + LOCK_STALE old.
+rm -rf "$f.lock"; mkdir "$f.lock"; stamp 1000
 before=$(calls)
 out=$(run_cached 1015)
 expect_eq       "tokenless lock, entry 15 s old: not taken over" "$(calls),$(ls "$f.lock" | wc -l | tr -d ' ')" "$before,0"
@@ -275,6 +288,34 @@ expect_eq       "symlinked lock: symlink left in place" "$([ -L "$f.lock" ] && e
 rm -f "$f.lock"; GHOST="$(mktemp -u)"; ln -s "$GHOST" "$f.lock"
 run_cached 3200 >/dev/null
 expect_eq       "dangling symlinked lock: target never created" "$([ -e "$GHOST" ] && echo created || echo absent)" absent
+
+# Only regular files are read: a FIFO at the entry or the owner path is a
+# miss / an unknown-age lock, never opened (a read would block forever).
+CD="$LLMUX_STATUSLINE_CACHE_DIR/fifo"
+WD="$(mktemp -d)"
+bounded() { # $1 = NOW: run_cached, killed after 10 s -> its output or "HUNG"
+  local pid n=0
+  run_cached "$1" > "$WD/out" & pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ $n -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    for p in "$CD"/*; do [ -p "$p" ] && { : <> "$p"; } 2>/dev/null; done # unblock a stuck reader
+    echo HUNG; return 0
+  fi
+  wait "$pid" 2>/dev/null || true
+  cat "$WD/out"
+}
+run_cached 8000 >/dev/null; f=$(fleet_file)
+rm -f "$f"; mkfifo "$f"
+out=$(bounded 8005)
+expect_contains "FIFO at the entry path: no hang, correct line" "$out" "$FLEET ↻17h10m"
+expect_eq       "FIFO at the entry path: replaced by a regular entry" "$([ -f "$f" ] && [ ! -p "$f" ] && head -n 1 "$f")" 8005
+rm -rf "$f.lock"; mkdir "$f.lock"; mkfifo "$f.lock/owner"
+before=$(calls)
+out=$(bounded 8020)
+expect_contains "FIFO as the lock's owner file: no hang, stale entry served" "$out" "CDX(1) 7d: 75% ↻16m55s"
+expect_eq       "FIFO as the lock's owner file: lock not taken over yet" "$(calls)" "$before"
+rm -rf "$f.lock"
 
 # A cache dir that is not this user's, or is a symlink, disables the cache.
 if [ ! -O /usr/share ]; then
@@ -410,5 +451,23 @@ echo "$GITIN" | PATH="$SLOWGIT:$PATH" ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/
   LLMUX_STATUSLINE_CACHE_DIR="$CDG" bash "$SCRIPT" >/dev/null 2>"$err"
 ts=$(head -n 1 "$CDG"/git-*)
 expect_eq "git entry stamped when git was read (>= start + 2 s)" "$([ $((ts - t0)) -ge 2 ] && echo ok || echo "ts-start=$((ts - t0))")" ok
+
+# Cache decisions use the time of the decision, not script start: a fleet
+# hit that comes after a slow git refresh (git stub: diff takes 3 s) is aged
+# by the post-git clock (real clock).
+CD="$LLMUX_STATUSLINE_CACHE_DIR/postgit"
+REPO2="$(mktemp -d)"
+git -C "$REPO2" init -q
+FS="$(mktemp -d)/llmux"
+printf '#!/bin/bash\ncat "%s"\n' "$PWD/fixture-coupling.json" > "$FS"
+chmod +x "$FS"
+echo "$INPUT" | ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$FS" \
+  LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" >/dev/null 2>"$err"
+out=$(echo '{"model":{"display_name":"T"},"workspace":{"current_dir":"'"$REPO2"'"}}' \
+  | PATH="$SLOWGIT:$PATH" ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$FS" \
+    LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" 2>"$err" | sed "$STRIP")
+cdx="${out##*CDX(1) 7d: 75% ↻}"; m="${cdx%%m*}"; sec="${cdx#*m}"; sec="${sec%%s*}"
+aged=$((1030 - (m * 60 + sec)))
+expect_eq "fleet hit after a 3 s git refresh: aged by post-git time (>= 2 s)" "$([ "$aged" -ge 2 ] && [ "$aged" -lt 10 ] && echo ok || echo "aged $aged s: $out")" ok
 
 exit $fail
