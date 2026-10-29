@@ -15,7 +15,7 @@ fail=0
 # Private cache dir: never read or write the user's ~/.cache from tests.
 LLMUX_STATUSLINE_CACHE_DIR="$(mktemp -d)"
 export LLMUX_STATUSLINE_CACHE_DIR
-trap 'rm -rf "$LLMUX_STATUSLINE_CACHE_DIR"' EXIT
+trap 'chmod -R u+rwx "$LLMUX_STATUSLINE_CACHE_DIR" 2>/dev/null; rm -rf "$LLMUX_STATUSLINE_CACHE_DIR"' EXIT
 
 run_with_fixture() { # $1 fixture file [$2 keep-colors] -> statusline output
   local stub filter
@@ -122,7 +122,7 @@ run_cached() { # $1 = NOW -> stripped line; stderr must stay empty
   if [ -s "$err" ]; then echo "STDERR: $(cat "$err")"; fi
 }
 calls() { wc -l < "$COUNTER" | tr -d ' '; }
-fleet_file() { local f; for f in "$CD"/fleet-*; do case "$f" in *.lock) ;; *) printf '%s' "$f" ;; esac; done; }
+fleet_file() { local f; for f in "$CD"/fleet-*; do case "$f" in *.lock|*.tmp.*) ;; *) printf '%s' "$f" ;; esac; done; }
 FLEET="CLD(3) 5h: 150% 7d: 110% 7df: 120%"
 
 out=$(run_cached 1000)
@@ -154,25 +154,183 @@ for kind in garbage truncated wrongkey future empty; do
   expect_eq       "corrupt entry ($kind) -> rewritten" "$(head -n 1 "$f"),$(tail -n 1 "$f")" "1011,end"
 done
 
-# Refresh lock: while another run refreshes (fresh lock), a stale entry is
-# served instead of a second llmux call; a lock left by a killed run
-# (older than 30 s) is broken.
+# Refresh lock: advisory, a directory holding "<ts>.<pid>.<random>". While a
+# live holder refreshes, a stale entry is served instead of a second llmux
+# call; a holder's lock 30 s old is broken.
+lock_as() { # $1 = owner token: a lock held by another run
+  rm -rf "$f.lock"; mkdir "$f.lock"; printf '%s\n' "$1" > "$f.lock/owner"
+}
+locks() { ls "$CD" | grep -c '\.lock$'; }
 before=$(calls)
-printf '1030\n' > "$f.lock"
+lock_as 1030.1.1
 out=$(run_cached 1030)
-expect_eq       "fresh lock + stale entry: no duplicate llmux call" "$(calls)" "$before"
-expect_contains "fresh lock + stale entry: stale entry served, countdown aged" "$out" "CDX(1) 7d: 75% ↻16m51s"
-printf '990\n' > "$f.lock"
+expect_eq       "live lock + stale entry: no duplicate llmux call" "$(calls)" "$before"
+expect_contains "live lock + stale entry: stale entry served, countdown aged" "$out" "CDX(1) 7d: 75% ↻16m51s"
+lock_as 1000.1.1
 out=$(run_cached 1030)
-expect_eq       "dead lock (40 s old) broken: recomputed" "$(calls)" $((before + 1))
-expect_eq       "dead lock broken: entry republished at 1030" "$(head -n 1 "$f")" 1030
-expect_eq       "dead lock broken: lock released" "$(ls "$CD" | grep -c '\.lock$')" 0
+expect_eq       "dead lock (30 s old) broken: recomputed" "$(calls)" $((before + 1))
+expect_eq       "dead lock broken: entry republished at 1030, lock released" "$(head -n 1 "$f"),$(locks)" "1030,0"
 
-# A real race: 20 sessions refresh one expired entry at the same moment
-# (llmux answers slowly). One refreshes; the rest serve the stale entry.
-# Tolerance 2: a racer that reads the lock between its O_EXCL create and its
-# ts write treats it as dead and refreshes too. Breaking an unreadable lock
-# is deliberate: honoring it could wedge the cache if a holder died there.
+# Stale serving is bounded: an entry 100 s old (> TTL + LOCK_STALE = 40) is
+# not served even when the lock can be neither honored nor removed.
+lock_as 1030.1.1; chmod 555 "$f.lock" # holder's lock this user cannot remove
+before=$(calls)
+out=$(run_cached 1130)
+expect_eq       "unremovable lock + entry 100 s old: computed inline" "$(calls)" $((before + 1))
+expect_contains "unremovable lock + entry 100 s old: fresh value" "$out" "CDX(1) 7d: 75% ↻17m10s"
+expect_eq       "unremovable lock: no publish without the lock" "$(head -n 1 "$f")" 1030
+chmod 755 "$f.lock"; rm -rf "$f.lock"
+printf 'junk\n' > "$f.lock"; chmod 444 "$f.lock" # not a lock dir of ours
+before=$(calls)
+out=$(run_cached 1130)
+expect_eq       "read-only junk lock file + entry 100 s old: computed inline" "$(calls)" $((before + 1))
+expect_contains "read-only junk lock file: fresh value" "$out" "CDX(1) 7d: 75% ↻17m10s"
+expect_eq       "read-only junk lock file: left untouched" "$(cat "$f.lock")" junk
+rm -f "$f.lock"
+
+# Deterministic interleavings: an llmux stub that blocks until a signal file
+# appears lets the test act while a refresher holds the lock.
+SIG="$(mktemp -d)"
+BSTUB="$(mktemp -d)/llmux"
+printf '#!/bin/bash\necho call >> "%s"\n: > "%s/started"\nn=0\nwhile [ ! -e "%s/go" ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n+1)); done\ncat "%s"\n' \
+  "$COUNTER" "$SIG" "$SIG" "$PWD/fixture-coupling.json" > "$BSTUB"
+chmod +x "$BSTUB"
+wait_for() { local n=0; while [ ! -e "$1" ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n+1)); done; [ -e "$1" ]; }
+bg_refresh() { # $1 = NOW: a refresher that blocks inside llmux; sets BG_PID
+  rm -f "$SIG/started" "$SIG/go"
+  echo "$INPUT" > "$SIG/in"
+  ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$BSTUB" LLMUX_STATUSLINE_NOW="$1" \
+    LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" < "$SIG/in" > "$SIG/out" 2> "$SIG/err" &
+  BG_PID=$!
+  wait_for "$SIG/started"
+}
+FAST_STUB="$STUB"; STUB="$BSTUB"
+CD="$LLMUX_STATUSLINE_CACHE_DIR/interleave"
+: > "$SIG/go"; run_cached 1000 >/dev/null; f=$(fleet_file)
+
+# (a) Lock stolen before publish (a breaker took it over): no publish.
+bg_refresh 1015
+held=$(cat "$f.lock/owner")
+lock_as 1015.1.1
+: > "$SIG/go"; wait "$BG_PID"
+expect_eq       "refresher held the lock while blocked" "${held%%.*}" 1015
+expect_eq       "lock stolen before publish: entry not republished" "$(head -n 1 "$f")" 1000
+expect_eq       "lock stolen before publish: staging file dropped" "$(ls "$CD" | grep -c '\.tmp\.')" 0
+expect_eq       "lock stolen before publish: thief's lock left alone" "$(cat "$f.lock/owner")" 1015.1.1
+expect_contains "lock stolen before publish: the run still shows its fresh value" "$(sed "$STRIP" "$SIG/out")" "CDX(1) 7d: 75% ↻17m10s"
+expect_eq       "lock stolen before publish: no stderr" "$(cat "$SIG/err")" ""
+
+# (b) Lock with no token yet (its creator between mkdir and the token write):
+#     not taken over until the entry is TTL + LOCK_STALE old.
+rm -rf "$f.lock"; mkdir "$f.lock"
+before=$(calls)
+out=$(run_cached 1015)
+expect_eq       "tokenless lock, entry 15 s old: not taken over" "$(calls),$(ls "$f.lock" | wc -l | tr -d ' ')" "$before,0"
+expect_contains "tokenless lock, entry 15 s old: stale entry served" "$out" "CDX(1) 7d: 75% ↻16m55s"
+run_cached 1039 >/dev/null
+expect_eq       "tokenless lock, entry 39 s old: not taken over" "$(calls)" "$before"
+run_cached 1040 >/dev/null
+expect_eq       "tokenless lock, entry 40 s old: taken over and refreshed" "$(calls)" $((before + 1))
+expect_eq       "tokenless lock taken over: republished, lock released" "$(head -n 1 "$f"),$(locks)" "1040,0"
+
+# (c) Killed holder: its lock is honored for LOCK_STALE, then expires.
+bg_refresh 1055
+kill -9 "$BG_PID"; wait "$BG_PID" 2>/dev/null || true; : > "$SIG/go"
+expect_eq       "killed holder: its lock is left behind" "$(cut -d. -f1 "$f.lock/owner")" 1055
+before=$(calls)
+run_cached 1070 >/dev/null
+expect_eq       "killed holder's lock 15 s old: honored" "$(calls)" "$before"
+run_cached 1085 >/dev/null
+expect_eq       "killed holder's lock 30 s old: expired, refreshed" "$(calls)" $((before + 1))
+expect_eq       "killed holder's lock expired: republished, lock released" "$(head -n 1 "$f"),$(locks)" "1085,0"
+STUB="$FAST_STUB"
+
+# Read-only cache dir after one write: stale entry served while bounded,
+# then computed inline; never an error, nothing written.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/ro"
+run_cached 2000 >/dev/null
+listing=$(ls -A "$CD")
+chmod 555 "$CD"
+before=$(calls)
+out=$(run_cached 2015)
+expect_eq       "read-only cache dir, entry 15 s old: stale served" "$(calls)" "$before"
+expect_contains "read-only cache dir, entry 15 s old: aged countdown" "$out" "CDX(1) 7d: 75% ↻16m55s"
+out=$(run_cached 2100)
+expect_eq       "read-only cache dir, entry 100 s old: computed inline" "$(calls)" $((before + 1))
+expect_contains "read-only cache dir, entry 100 s old: fresh value" "$out" "CDX(1) 7d: 75% ↻17m10s"
+expect_eq       "read-only cache dir: nothing written" "$(ls -A "$CD")" "$listing"
+chmod 755 "$CD"
+
+# A symlink at the lock path is never followed, written or removed.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/symlock"
+run_cached 3000 >/dev/null; f=$(fleet_file)
+VICTIM="$(mktemp)"; printf 'VICTIM\n' > "$VICTIM"
+ln -s "$VICTIM" "$f.lock"
+out=$(run_cached 3015)
+expect_contains "symlinked lock, entry 15 s old: stale served" "$out" "CDX(1) 7d: 75% ↻16m55s"
+out=$(run_cached 3100)
+expect_contains "symlinked lock, entry 100 s old: fresh value" "$out" "CDX(1) 7d: 75% ↻17m10s"
+expect_eq       "symlinked lock: victim file untouched" "$(cat "$VICTIM")" VICTIM
+expect_eq       "symlinked lock: symlink left in place" "$([ -L "$f.lock" ] && echo link)" link
+rm -f "$f.lock"; GHOST="$(mktemp -u)"; ln -s "$GHOST" "$f.lock"
+run_cached 3200 >/dev/null
+expect_eq       "dangling symlinked lock: target never created" "$([ -e "$GHOST" ] && echo created || echo absent)" absent
+
+# A cache dir that is not this user's, or is a symlink, disables the cache.
+if [ ! -O /usr/share ]; then
+  CD=/usr/share
+  before=$(calls)
+  out=$(run_cached 4000); out2=$(run_cached 4000)
+  expect_eq       "cache dir owned by another user: uncached" "$(calls)" $((before + 2))
+  expect_contains "cache dir owned by another user: still renders" "$out$out2" "$FLEET ↻17h10m"
+fi
+REAL="$(mktemp -d)"
+ln -s "$REAL" "$LLMUX_STATUSLINE_CACHE_DIR/linked"
+CD="$LLMUX_STATUSLINE_CACHE_DIR/linked"
+before=$(calls)
+out=$(run_cached 4000); out2=$(run_cached 4000)
+expect_eq       "symlinked cache dir: uncached" "$(calls)" $((before + 2))
+expect_eq       "symlinked cache dir: nothing written through it" "$(ls -A "$REAL" | wc -l | tr -d ' ')" 0
+expect_contains "symlinked cache dir: still renders" "$out$out2" "$FLEET ↻17h10m"
+
+# The fleet entry is keyed on the executable llmux resolves to: two PATHs,
+# two daemons' answers, no cross-talk inside the TTL.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/resolve"
+DA="$(mktemp -d)"; DB="$(mktemp -d)"
+printf '#!/bin/bash\ncat "%s"\n' "$PWD/fixture-fleet.json" > "$DA/llmux"
+printf '#!/bin/bash\ncat "%s"\n' "$PWD/fixture-coupling.json" > "$DB/llmux"
+chmod +x "$DA/llmux" "$DB/llmux"
+run_path() { # $1 = dir first on PATH
+  echo "$INPUT" | PATH="$1:$PATH" ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN=llmux \
+    LLMUX_STATUSLINE_NOW=7000 LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" 2>"$err" | sed "$STRIP"
+  if [ -s "$err" ]; then echo "STDERR: $(cat "$err")"; fi
+}
+expect_contains "llmux resolved in dir A: A's fleet"           "$(run_path "$DA")" "CLD(3) 5h: 150% 7d: 150% 7df: 150%"
+expect_contains "llmux resolved in dir B: B's fleet, not A's"  "$(run_path "$DB")" "$FLEET"
+expect_contains "llmux resolved in dir A again: A's (cached)"  "$(run_path "$DA")" "CLD(3) 5h: 150% 7d: 150% 7df: 150%"
+expect_eq       "two resolutions: two fleet entries" "$(ls "$CD" | grep -c '^fleet-[0-9]*$')" 2
+
+# The fleet entry is stamped when llmux answered, not when the run started
+# (real clock; the stub takes 3 s).
+CD="$LLMUX_STATUSLINE_CACHE_DIR/stamp"
+SSTUB="$(mktemp -d)/llmux"
+printf '#!/bin/bash\nsleep 3\ncat "%s"\n' "$PWD/fixture-coupling.json" > "$SSTUB"
+chmod +x "$SSTUB"
+t0=$(date +%s)
+echo "$INPUT" | ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$SSTUB" \
+  LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" >/dev/null 2>"$err"
+ts=$(head -n 1 "$(fleet_file)")
+expect_eq "fleet entry stamped at llmux's answer (>= start + 2 s)" "$([ $((ts - t0)) -ge 2 ] && echo ok || echo "ts-start=$((ts - t0))")" ok
+
+# NUL inside a field: dropped, as main's command substitutions did.
+want=$'\033[36mAB\033[0m \033[2mhi\033[0m\033[2m | \033[0m\033[2mctx --\033[0m\033[2m | \033[0m\033[34m/tmp\033[0m\033[2m | \033[0m\033[2mno-git\033[0m'
+got=$(echo '{"model":{"display_name":"A\u0000B"},"cwd":"/tmp","effort":{"level":"hi"}}' \
+  | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" 2>"$err")
+expect_eq "NUL in a field: full line byte-identical to main@8b4fc1e" "$got" "$want"
+expect_eq "NUL in a field: no stderr" "$(cat "$err")" ""
+
+# Smoke: 20 sessions refresh one expired entry at the same moment (llmux
+# answers slowly). Exactly one refreshes; the rest serve the stale entry.
 race() { # $1 = NOW; 20 concurrent runs -> $RD/out.*
   local i
   rm -f "$RD"/out.*
@@ -195,25 +353,20 @@ CD="$LLMUX_STATUSLINE_CACHE_DIR/race"
 run_cached 5000 >/dev/null
 before=$(calls)
 race 5020
-got=$(( $(calls) - before ))
-expect_eq "race on an expired entry: 1-2 refreshes, not 20" "$([ "$got" -ge 1 ] && [ "$got" -le 2 ] && echo ok || echo "$got calls")" ok
+expect_eq "race on an expired entry: one refresh, not 20" "$(( $(calls) - before ))" 1
 expect_eq "race on an expired entry: every session renders" "$(all_render && echo ok)" ok
-run_cached 5021 >/dev/null
 f=$(fleet_file)
-expect_eq "race on an expired entry: valid entry afterwards" "$(tail -n 1 "$f"),$(ls "$CD" | grep -c '\.lock$')" "end,0"
+expect_eq "race on an expired entry: valid entry, no lock or staging left" "$(head -n 1 "$f"),$(tail -n 1 "$f"),$(ls "$CD" | grep -c '\.lock$\|\.tmp\.')" "5020,end,0"
 # Cold start (fresh install, reboot that wiped the cache): no entry to serve,
-# so every racer computes once; one publishes.
+# so every racer computes once; the lock holder publishes.
 CD="$LLMUX_STATUSLINE_CACHE_DIR/race-cold"
 before=$(calls)
 race 6000
 expect_eq "cold-start race: each session computes once" "$(( $(calls) - before ))" 20
 expect_eq "cold-start race: every session renders" "$(all_render && echo ok)" ok
-run_cached 6001 >/dev/null
 f=$(fleet_file)
-expect_eq "cold-start race: valid entry afterwards" "$(tail -n 1 "$f"),$(ls "$CD" | grep -c '\.lock$')" "end,0"
-STUB="$(mktemp -d)/llmux"
-printf '#!/bin/bash\necho call >> "%s"\ncat "%s"\n' "$COUNTER" "$PWD/fixture-coupling.json" > "$STUB"
-chmod +x "$STUB"
+expect_eq "cold-start race: valid entry, no lock or staging left" "$(head -n 1 "$f"),$(tail -n 1 "$f"),$(ls "$CD" | grep -c '\.lock$\|\.tmp\.')" "6000,end,0"
+STUB="$FAST_STUB"
 
 # TTL=0 turns caching off: every run asks llmux, nothing is written.
 CD="$LLMUX_STATUSLINE_CACHE_DIR/ttl0"

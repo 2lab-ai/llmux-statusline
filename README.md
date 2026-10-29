@@ -118,7 +118,11 @@ Claude Code runs the statusline every few seconds in every open session, so it i
 built to start as few processes as possible. With a warm cache a refresh starts
 `bash` plus one `jq`. One session per cwd and per llmux daemon refreshes the cache;
 the others reuse it. The git segment can therefore lag the working tree by up to
-the TTL. The llmux countdowns are aged by the cache age, so they stay exact.
+the TTL. While another session is refreshing, an expired entry may be shown for
+up to TTL + 30 s, after which a session computes the value itself. The llmux
+countdowns are aged from the moment llmux answered, so they stay accurate to
+about a second. The cache is used only in a directory owned by you (created
+mode 700); a missing, foreign or symlinked directory just turns it off.
 
 Remote daemons work out of the box: when `ANTHROPIC_BASE_URL` points at a non-local host,
 the script queries it via `llmux status --json --remote host:port`.

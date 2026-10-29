@@ -83,18 +83,48 @@ llmux_target() {
 }
 llmux_target
 
+llmux_exe() {
+  # Sets LLMUX_EXE to the absolute path of the file "$LLMUX_BIN" executes as
+  # (the PATH search exec does; `type -P` without its comsub fork), or "".
+  local p="" d rest
+  LLMUX_EXE=""
+  case "$LLMUX_BIN" in
+    */*) [ -f "$LLMUX_BIN" ] && [ -x "$LLMUX_BIN" ] && p="$LLMUX_BIN" ;;
+    *)
+      rest="$PATH:"
+      while [ -n "$rest" ]; do
+        d="${rest%%:*}"; rest="${rest#*:}"
+        [ -z "$d" ] && d=.
+        if [ -f "$d/$LLMUX_BIN" ] && [ -x "$d/$LLMUX_BIN" ]; then p="$d/$LLMUX_BIN"; break; fi
+      done ;;
+  esac
+  case "$p" in
+    '') ;;
+    /*) LLMUX_EXE="$p" ;;
+    *) LLMUX_EXE="$PWD/$p" ;;
+  esac
+}
+# Fleet cache key: the executable that answers + the daemon it asks. Unknown
+# executable -> no key -> uncached.
+LLMUX_KEY=""
+if [ -n "$target" ]; then
+  llmux_exe
+  [ -n "$LLMUX_EXE" ] && LLMUX_KEY="$LLMUX_EXE|$target"
+fi
+
 # --- Every stdin field in one jq call -------------------------------------
 # Each field reproduces `$(echo "$input" | jq -r '<expr>')` of the original
 # script: errors isolated per field, non-strings JSON-encoded, multiple
-# outputs newline-joined, trailing newlines stripped. Also: the wall clock,
-# the cache keys + djb2 hashes, and the direct-mode remaining % computed in
-# double arithmetic exactly as awk did ("?" = an input awk would coerce; the
-# script then runs that awk itself).
+# outputs newline-joined, trailing newlines stripped, NULs dropped (as bash
+# command substitution drops them). Also: the wall clock, the cache keys +
+# djb2 hashes, and the direct-mode remaining % computed in double arithmetic
+# exactly as awk did ("?" = an input awk would coerce; the script then runs
+# that awk itself).
 JQ_STDIN='
-def s: if type == "string" then . else tojson end;
+def s: (if type == "string" then . else tojson end) | gsub("\u0000"; "");
 def rs: if endswith("\n") then .[:-1] | rs else . end;
 def f(e): [e | s] | join("\n") | rs;
-def h: reduce explode[] as $c (5381; (. * 33 + $c) % 4294967296) | tostring;
+def h: try (reduce explode[] as $c (5381; (. * 33 + $c) % 4294967296) | tostring) catch "";
 def rem(u; cap): (100 - u) | (if . < 0 then 0 else . end)
   | (if cap == null then . else ([., cap] | min) end) | floor;
 (try f(.workspace.current_dir // .cwd) catch "") as $cwd
@@ -122,7 +152,7 @@ def rem(u; cap): (100 - u) | (if . < 0 then 0 else . end)
         | [.input_tokens, .output_tokens, .cache_creation_input_tokens, .cache_read_input_tokens]
         | map(. // 0) | add) catch ""),
     (try f(.context_window.used_percentage // empty) catch ""),
-    $cwd, $gk, ($gk | h), ($lk | h),
+    $cwd, $gk, ($gk | h), (if $lk == "" then "" else ($lk | h) end),
     (try f($t | join(" ")) catch ""),
     $rem[] ]
 | join("\u0000") + "\u0000"'
@@ -133,20 +163,28 @@ def rem(u; cap): (100 - u) | (if . < 0 then 0 else . end)
   IFS= read -r -d '' git_hash; IFS= read -r -d '' fleet_hash; IFS= read -r -d '' rl_tuple
   IFS= read -r -d '' j_rem7; IFS= read -r -d '' j_rem5; IFS= read -r -d '' j_remf
 } < <(exec jq -j --arg gd "${GIT_DIR-}" --arg gwt "${GIT_WORK_TREE-}" \
-        --arg lk "$LLMUX_BIN|$target" "$JQ_STDIN" 2>/dev/null)
+        --arg lk "$LLMUX_KEY" "$JQ_STDIN" 2>/dev/null)
 
-# Wall clock (LLMUX_STATUSLINE_NOW overrides it, for tests). It drives the
-# blink phase, the reset countdowns and cache ages.
+# Wall clock (LLMUX_STATUSLINE_NOW fixes it, for tests). It drives the blink
+# phase, the reset countdowns and cache ages. S0 + $SECONDS (a builtin)
+# tell how far the real clock has moved since; a fixed clock does not move.
+CLOCK_FIXED=""
 NOW_S="${LLMUX_STATUSLINE_NOW:-}"
-is_int "$NOW_S" || NOW_S="$J_NOW"
+if is_int "$NOW_S"; then CLOCK_FIXED=1; else NOW_S="$J_NOW"; fi
 is_int "$NOW_S" || NOW_S=$(exec date +%s)
+S0=$SECONDS
+now_s() { # -> NOW_T = wall clock now, no fork (+-1 s)
+  if [ -n "$CLOCK_FIXED" ]; then NOW_T=$NOW_S; else NOW_T=$((NOW_S + SECONDS - S0)); fi
+}
 
 # --- Shared cache ----------------------------------------------------------
-# Entry file, one field per line: ts, magic, key, A, B, "end". The ts line
-# first makes a refresh lock (<entry>.lock = "ts\n") a valid prefix: the
-# lock holder appends the rest and renames the lock over the entry, which
-# publishes atomically and releases the lock in one `mv`. Anything that does
-# not parse (missing, truncated, garbage, other key, future ts) is a miss.
+# One entry file per key: ts, magic, key, A, B, "end", one per line. Every
+# refresher writes its own staging file and publishes it with one `mv`
+# (atomic rename), so a reader sees a complete old entry or a complete new
+# one; anything that does not parse is a miss. The refresh lock (<entry>.lock,
+# a directory holding the owner's token) is advisory: it only spares
+# duplicate refreshes, and nothing breaks if two runs refresh at once.
+# The cache is used only in a real directory owned by this user.
 cache_get() { # <file> <magic> <key> -> C_TS C_A C_B; 0 = well-formed entry
   local m k e
   C_TS=""; C_A=""; C_B=""
@@ -157,47 +195,83 @@ cache_get() { # <file> <magic> <key> -> C_TS C_A C_B; 0 = well-formed entry
   [ "$m" = "$2" ] && [ "$k" = "$3" ] && [ "$e" = "end" ] && is_int "$C_TS"
 }
 
-cache_lock() { # <file>: 0 = this run owns <file>.lock and must publish
-  local lk="$1.lock" lts rc
-  set -C # noclobber: the create below is O_EXCL
-  { printf '%s\n' "$NOW_S" > "$lk"; } 2>/dev/null
-  rc=$?
-  set +C
-  [ "$rc" -eq 0 ] && return 0
-  [ -e "$lk" ] || return 1 # just published by its holder
-  lts=""
-  { IFS= read -r lts; } 2>/dev/null < "$lk"
-  if ! is_int "$lts" || [ $((NOW_S - lts)) -ge "$LOCK_STALE" ] || [ "$lts" -gt "$NOW_S" ]; then
-    # holder died (or the lock is unreadable / from the future): take it over
-    { printf '%s\n' "$NOW_S" > "$lk"; } 2>/dev/null && return 0
+TOKEN="$NOW_S.$$.$RANDOM" # this run's lock owner token: "<ts>.<pid>.<random>"
+
+lock_owned() { # <lockdir>: 0 = the lock exists and holds this run's token
+  local tok=""
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  { IFS= read -r tok < "$1/owner"; } 2>/dev/null
+  [ "$tok" = "$TOKEN" ]
+}
+
+lock_take() { # <lockdir> <entry age, "" = no entry>: 0 = this run holds the lock
+  local lk="$1" tok="" lts
+  [ -L "$lk" ] && return 1 # never act on a symlink
+  if [ -e "$lk" ]; then
+    [ -d "$lk" ] && [ -O "$lk" ] || return 1 # not a lock of ours: leave it alone
+    { IFS= read -r tok < "$lk/owner"; } 2>/dev/null
+    lts="${tok%%.*}"
+    if is_int "$lts"; then
+      # the holder's token: live until LOCK_STALE old
+      [ $((NOW_S - lts)) -lt "$LOCK_STALE" ] && [ $((lts - NOW_S)) -le 5 ] && return 1
+    else
+      # no token (its holder sits between mkdir and the token write, or died
+      # there): age unknown, so it is broken only once the entry has gone
+      # unrefreshed for LOCK_STALE past its TTL, or when there is no entry
+      [ -n "$2" ] && [ "$2" -lt $((CACHE_TTL + LOCK_STALE)) ] && return 1
+    fi
+    rm -rf "$lk" 2>/dev/null # a dead holder's lock: break it, retry once
   fi
-  return 1
+  mkdir -m 700 "$lk" 2>/dev/null || return 1
+  set -C
+  { printf '%s\n' "$TOKEN" > "$lk/owner"; } 2>/dev/null
+  set +C
+  return 0
 }
 
 # cached <name> <key> <hash> <compute-fn>: C_A/C_B from a fresh entry, else
-# from <compute-fn> (published when this run wins the refresh lock). While
-# another session holds the lock, a stale entry is served instead of a
-# duplicate computation. C_AGE = age in seconds of what is served.
+# from <compute-fn>, published when this run holds the refresh lock. While
+# another run holds it, a stale entry is served, but only while it is younger
+# than TTL + LOCK_STALE; past that this run computes inline. C_AGE = age in
+# seconds of what is served. <compute-fn> may set C_TS_NEW (default NOW_S),
+# the time its data was sampled.
 cached() {
-  local file="$CACHE_DIR/$1-$3" magic="llmux-statusline-$1-v1" key="$2" fn="$4" stale=""
-  if [ "$CACHE_TTL" -gt 0 ] && [ -n "$3" ]; then
-    if cache_get "$file" "$magic" "$key"; then
-      C_AGE=$((NOW_S - C_TS))
-      if [ "$C_AGE" -ge 0 ]; then
-        [ "$C_AGE" -lt "$CACHE_TTL" ] && return 0
-        stale=1
-      fi
-    fi
-    [ -d "$CACHE_DIR" ] || mkdir -p "$CACHE_DIR" 2>/dev/null
-    if cache_lock "$file"; then
-      C_AGE=0
-      "$fn"
-      { printf '%s\n%s\n%s\n%s\n%s\n' "$magic" "$key" "$C_A" "$C_B" end >> "$file.lock"; } 2>/dev/null &&
-        mv -f "$file.lock" "$file" 2>/dev/null
-      return 0
-    fi
-    [ -n "$stale" ] && return 0 # C_A/C_B/C_AGE still hold the stale entry
+  local file="$CACHE_DIR/$1-$3" magic="llmux-statusline-$1-v1" key="$2" fn="$4" lk age=""
+  C_AGE=0; C_TS_NEW="$NOW_S"
+  if [ "$CACHE_TTL" -eq 0 ] || [ -z "$3" ]; then "$fn"; return 0; fi
+  if [ ! -e "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; then
+    ( umask 077; exec mkdir -p "$CACHE_DIR" ) 2>/dev/null
   fi
+  if ! { [ -d "$CACHE_DIR" ] && [ -O "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; }; then
+    "$fn"; return 0
+  fi
+  if cache_get "$file" "$magic" "$key"; then
+    age=$((NOW_S - C_TS))
+    # stamped up to 5 s ahead: clock granularity between concurrent runs
+    [ "$age" -lt 0 ] && [ "$age" -ge -5 ] && age=0
+    if [ "$age" -ge 0 ]; then
+      C_AGE=$age
+      [ "$age" -lt "$CACHE_TTL" ] && return 0
+    else
+      age="" # from the future: a miss
+    fi
+  fi
+  lk="$file.lock"
+  if lock_take "$lk" "$age"; then
+    C_AGE=0
+    "$fn"
+    # publish: own staging file (O_EXCL create), ownership re-checked, mv
+    ( umask 077
+      stage="$file.tmp.$$.$RANDOM"
+      set -C
+      printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$C_TS_NEW" "$magic" "$key" "$C_A" "$C_B" end > "$stage" || exit 1
+      lock_owned "$lk" && exec mv -f "$stage" "$file"
+      exec rm -f "$stage" # the lock was taken over meanwhile: its holder publishes
+    ) 2>/dev/null
+    lock_owned "$lk" && rm -rf "$lk" 2>/dev/null
+    return 0
+  fi
+  [ -n "$age" ] && [ "$age" -lt $((CACHE_TTL + LOCK_STALE)) ] && return 0 # stale, bounded
   C_AGE=0
   "$fn"
 }
@@ -429,7 +503,7 @@ pct_paint() {
 # both the sums and the (N) count.
 # Output: "<daemon port>\037cl_n cl5 cl7 clf cl_rs cx_n cx7 cx_rs".
 JQ_FLEET='
-def s: if type == "string" then . else tojson end;
+def s: (if type == "string" then . else tojson end) | gsub("\u0000"; "");
 def c01: if . < 0 then 0 elif . > 1 then 1 else . end;
 def usable: select(.status != "auth_failed" and .blocked != "paused");
 (try ([.port // empty | s] | join("\n")) catch "")
@@ -455,7 +529,7 @@ def usable: select(.status != "auth_failed" and .blocked != "paused");
       (([$cx[] | (1 - ((.seven_day.utilization // 0) | c01)) * 100]
         | add // 0) | round),
       (([$cx[].seven_day.resets_in_secs] | map(select(. != null)) | min) // "-") ]
-  | join(" ")) catch "")'
+  | join(" ") | s) catch "")'
 fleet_fetch() { # -> C_A = daemon port, C_B = summary tuple (both empty: no usable answer)
   local fj parsed
   C_A=""; C_B=""
@@ -464,6 +538,8 @@ fleet_fetch() { # -> C_A = daemon port, C_B = summary tuple (both empty: no usab
   else
     fj=$(exec "$LLMUX_BIN" status --json --remote "$target" 2>/dev/null)
   fi
+  # the countdowns are as of this moment: stamp the entry with it
+  now_s; C_TS_NEW=$NOW_T
   [ -n "$fj" ] || return 0
   parsed=$(exec jq -r "$JQ_FLEET" 2>/dev/null <<< "$fj")
   case "$parsed" in
@@ -473,9 +549,9 @@ fleet_fetch() { # -> C_A = daemon port, C_B = summary tuple (both empty: no usab
 
 rate_seg=""
 if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
-  # Cached per binary + target (failures too, so a dead daemon is asked once
-  # per TTL, not once per refresh of every session).
-  cached fleet "$LLMUX_BIN|$target" "$fleet_hash" fleet_fetch
+  # Cached per resolved executable + target (failures too, so a dead daemon
+  # is asked once per TTL, not once per refresh of every session).
+  cached fleet "$LLMUX_KEY" "$fleet_hash" fleet_fetch
   daemon_port="$C_A"; fleet_tuple="$C_B"
   if [ "$target" = "local" ]; then
     # Guard: the local daemon we asked must be the one the session points at.
