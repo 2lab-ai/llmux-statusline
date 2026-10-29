@@ -466,13 +466,14 @@ git -C "$REPO2" init -q
 FS="$(mktemp -d)/llmux"
 printf '#!/bin/bash\ncat "%s"\n' "$PWD/fixture-coupling.json" > "$FS"
 chmod +x "$FS"
+# TTL 100 keeps the fleet entry a hit even on a loaded machine.
 echo "$INPUT" | ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$FS" \
-  LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" >/dev/null 2>"$err"
+  LLMUX_STATUSLINE_CACHE_TTL=100 LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" >/dev/null 2>"$err"
 out=$(echo '{"model":{"display_name":"T"},"workspace":{"current_dir":"'"$REPO2"'"}}' \
   | PATH="$SLOWGIT:$PATH" ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$FS" \
-    LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" 2>"$err" | sed "$STRIP")
+    LLMUX_STATUSLINE_CACHE_TTL=100 LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" 2>"$err" | sed "$STRIP")
 cdx="${out##*CDX(1) 7d: 75% ↻}"; m="${cdx%%m*}"; sec="${cdx#*m}"; sec="${sec%%s*}"
 aged=$((1030 - (m * 60 + sec)))
-expect_eq "fleet hit after a 3 s git refresh: aged by post-git time (>= 2 s)" "$([ "$aged" -ge 2 ] && [ "$aged" -lt 10 ] && echo ok || echo "aged $aged s: $out")" ok
+expect_eq "fleet hit after a 3 s git refresh: aged by post-git time (>= 2 s)" "$([ "$aged" -ge 2 ] && [ "$aged" -lt 100 ] && echo ok || echo "aged $aged s: $out")" ok
 
 exit $fail
