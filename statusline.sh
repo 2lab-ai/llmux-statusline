@@ -53,7 +53,8 @@ LLMUX_BIN="${LLMUX_STATUSLINE_BIN:-llmux}"
 CACHE_TTL="${LLMUX_STATUSLINE_CACHE_TTL:-10}"
 case "$CACHE_TTL" in ''|*[!0-9]*|0?*) CACHE_TTL=10 ;; esac
 CACHE_DIR="${LLMUX_STATUSLINE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/llmux-statusline}"
-LOCK_STALE=30 # seconds: a refresh lock older than this belongs to a killed run
+LOCK_STALE="${LLMUX_STATUSLINE_LOCK_STALE:-30}" # s: a refresh lock this old belongs to a killed run
+case "$LOCK_STALE" in ''|*[!0-9]*|0*) LOCK_STALE=30 ;; esac
 
 # is_int <s>: a plain decimal integer that bash arithmetic reads exactly as awk
 # does (no octal-looking leading zeros, no overflow). Anything else takes the
@@ -181,7 +182,8 @@ now_s() { # -> NOW_T = wall clock now, no fork (+-1 s)
 # INVARIANT (the contract every change here must keep):
 #   1. A published entry is always complete.
 #   2. Its timestamp truthfully records when its data was read.
-#   3. A value is never shown once its age is >= TTL + LOCK_STALE.
+#   3. A value is never shown once its age is >= TTL + LOCK_STALE (checked when
+#      a segment is chosen, and again for every segment right before printing).
 # The refresh lock is advisory: it only spares duplicate refreshes. The
 # windows between an owner/age check and the mv/rm that follows are accepted:
 # their only possible effects are a duplicate refresh or, briefly, an older
@@ -249,8 +251,9 @@ lock_take() { # <lockdir> <entry age, "" = no entry>: 0 = this run holds the loc
 }
 
 # publish <file> <lockdir> <magic> <key>: C_TS_NEW/C_A/C_B as an entry, via
-# this run's own staging file, if this run holds the lock or the entry there
-# is missing, invalid, stamped from the future, or older than C_TS_NEW.
+# this run's own staging file, if the entry there is missing, invalid,
+# stamped > 5 s in the future, or older than C_TS_NEW; on an equal stamp only
+# the lock holder publishes (the lock breaks ties, never beats newer data).
 publish() {
   ( umask 077
     stage="$1.tmp.$$.$RANDOM"
@@ -258,36 +261,37 @@ publish() {
     set -C
     printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$C_TS_NEW" "$3" "$4" "$C_A" "$C_B" end > "$stage" || exit 1
     now_s
-    if lock_owned "$2" || ! cache_get "$1" "$3" "$4" ||
-       [ "$C_TS" -lt "$C_TS_NEW" ] || [ "$C_TS" -gt $((NOW_T + 5)) ]; then
+    if ! cache_get "$1" "$3" "$4" || [ "$C_TS" -gt $((NOW_T + 5)) ] ||
+       [ "$C_TS" -lt "$C_TS_NEW" ] || { [ "$C_TS" -eq "$C_TS_NEW" ] && lock_owned "$2"; }; then
       exec mv -f "$stage" "$1"
     fi
     exec rm -f "$stage" # a newer entry is there already
   ) 2>/dev/null
 }
 
-# cached <name> <key> <hash> <compute-fn>: C_A/C_B from a fresh entry, else
-# from <compute-fn>. While another run holds the lock, a stale entry is
-# served, but only while it is younger than TTL + LOCK_STALE; past that this
-# run computes inline. C_AGE = age in seconds of what is served.
-# <compute-fn> sets C_TS_NEW to when its data was read (default: now).
+# cached <name> <key> <hash> <compute-fn> [force]: C_A/C_B from a fresh
+# entry, else from <compute-fn> ("force" skips straight to computing). While
+# another run holds the lock, a stale entry is served, but only while it is
+# younger than TTL + LOCK_STALE; past that this run computes inline.
+# C_AGE = age in seconds of what is served, C_SRC_TS = when its data was
+# read. <compute-fn> sets C_TS_NEW to that time (default: now).
 cached() {
   local file="$CACHE_DIR/$1-$3" magic="llmux-statusline-$1-v1" key="$2" fn="$4" lk age=""
   now_s
   C_AGE=0; C_TS_NEW="$NOW_T"
-  if [ "$CACHE_TTL" -eq 0 ] || [ -z "$3" ]; then "$fn"; return 0; fi
+  if [ "$CACHE_TTL" -eq 0 ] || [ -z "$3" ]; then "$fn"; C_SRC_TS=$C_TS_NEW; return 0; fi
   if [ ! -e "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; then
     ( umask 077; exec mkdir -p "$CACHE_DIR" ) 2>/dev/null
   fi
   if ! { [ -d "$CACHE_DIR" ] && [ -O "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; }; then
-    "$fn"; return 0
+    "$fn"; C_SRC_TS=$C_TS_NEW; return 0
   fi
-  if cache_get "$file" "$magic" "$key"; then
+  if [ "${5:-}" != force ] && cache_get "$file" "$magic" "$key"; then
     age=$((NOW_T - C_TS))
     # stamped up to 5 s ahead: clock granularity between concurrent runs
     [ "$age" -lt 0 ] && [ "$age" -ge -5 ] && age=0
     if [ "$age" -ge 0 ]; then
-      C_AGE=$age
+      C_AGE=$age; C_SRC_TS=$C_TS
       [ "$age" -lt "$CACHE_TTL" ] && return 0
     else
       age="" # from the future: a miss
@@ -296,14 +300,14 @@ cached() {
   lk="$file.lock"
   if lock_take "$lk" "$age"; then
     C_AGE=0
-    "$fn"
+    "$fn"; C_SRC_TS=$C_TS_NEW
     publish "$file" "$lk" "$magic" "$key"
     lock_owned "$lk" && rm -rf "$lk" 2>/dev/null
     return 0
   fi
   [ -n "$age" ] && [ "$age" -lt $((CACHE_TTL + LOCK_STALE)) ] && return 0 # stale, bounded
   C_AGE=0
-  "$fn"
+  "$fn"; C_SRC_TS=$C_TS_NEW
   publish "$file" "$lk" "$magic" "$key" # newest data wins
 }
 
@@ -442,15 +446,15 @@ case "$cwd" in
   /*) case "$git_key" in *$'\n'*) git_hash="" ;; esac ;;
   *) git_hash="" ;;
 esac
-cached git "$git_key" "$git_hash" git_compute
-git_seg="$C_A"
+git_segment() { # [force] -> git_seg, GIT_TS (when its data was read)
+  cached git "$git_key" "$git_hash" git_compute "${1:-}"
+  git_seg="$C_A"; GIT_TS="$C_SRC_TS"
+}
+git_segment
 
 # --- Rate limits (rightmost): llmux fleet sums when routed through llmux,
 # --- else the session's own 5h usage ---
 
-# Clock for this segment (blink phase, payload countdowns): read after the
-# git work, as the original script's `date` call was.
-now_s; NOW_R=$NOW_T
 
 human_dur() { # $1 = seconds -> HD ("1d2h" / "7h15m" / "15m10s")
   local s="$1"
@@ -585,96 +589,110 @@ fleet_fetch() { # -> C_A = daemon port, C_B = summary tuple (both empty: no usab
   esac
 }
 
-rate_seg=""
-if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
-  # Cached per resolved executable + target (failures too, so a dead daemon
-  # is asked once per TTL, not once per refresh of every session).
-  cached fleet "$LLMUX_KEY" "$fleet_hash" fleet_fetch
-  daemon_port="$C_A"; fleet_tuple="$C_B"
-  if [ "$target" = "local" ]; then
-    # Guard: the local daemon we asked must be the one the session points at.
-    url_port="${ANTHROPIC_BASE_URL#*://}"; url_port="${url_port%%/*}"
-    case "$url_port" in *:*) url_port="${url_port##*:}" ;; *) url_port=3456 ;; esac
-    [ "$daemon_port" = "$url_port" ] || fleet_tuple=""
-  fi
-  if [ -n "$fleet_tuple" ]; then
-    read -r cl_n cl5 cl7 clf cl_rs cx_n cx7 cx_rs <<< "$fleet_tuple"
-    # A cached answer is C_AGE seconds old: move its countdowns forward.
-    if [ "$C_AGE" -gt 0 ]; then
-      is_int "${cl_rs:-}" && cl_rs=$((cl_rs - C_AGE))
-      is_int "${cx_rs:-}" && cx_rs=$((cx_rs - C_AGE))
-    fi
-    if [ -n "${cl_n:-}" ]; then
-      if [ "$cl_n" -gt 0 ] 2>/dev/null; then
-        pct_paint "$cl5" "$cl_n"; c5="$PC"
-        pct_paint "$cl7" "$cl_n"; c7="$PC"
-        pct_paint "$clf" "$cl_n"; cf="$PC"
-        reset_span "${cl_rs:-}"
-        rate_seg="${MAGENTA}CLD(${cl_n})${RESET} ${DIM}5h:${RESET} ${c5}${cl5}%${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}${RS}"
-      fi
-      if [ "$cx_n" -gt 0 ] 2>/dev/null; then
-        pct_paint "$cx7" "$cx_n"
-        reset_span "${cx_rs:-}"
-        cdx="${CYAN}CDX(${cx_n})${RESET} ${DIM}7d:${RESET} ${PC}${cx7}%${RESET}${RS}"
-        if [ -n "$rate_seg" ]; then rate_seg="${rate_seg}${DIM} | ${RESET}${cdx}"; else rate_seg="$cdx"; fi
-      fi
-    fi
-  fi
-fi
-# Fallback (no llmux, daemon down, port mismatch, parse failure): the
-# session's own windows as reported by Claude Code, in REMAINING terms with
-# the same coupling cap (rem5h_eff = min(rem5h, 5*rem7d)). The harness
-# currently reports only five_hour and seven_day; a fable weekly window is
-# picked up automatically if it ever appears. Never an error.
 join_parts() { local IFS=' '; rate_seg="${parts[*]}"; }
-if [ -z "$rate_seg" ]; then
-  read -r u5 r5at u7 r7at uf <<< "$rl_tuple"
-  rem7=""
-  if [ -n "${u7:-}" ] && [ "$u7" != "-" ]; then
-    if [ "$j_rem7" = "?" ]; then
-      rem7=$(exec awk -v u="$u7" 'BEGIN{ r=100-u; if (r<0) r=0; printf "%d", r }')
-    else
-      rem7="$j_rem7"
+rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read; "" = not asked)
+  rate_seg=""; FLEET_TS=""
+  # Clock for this segment (blink phase, payload countdowns): read after the
+  # git work, as the original script's `date` call was.
+  now_s; NOW_R=$NOW_T
+  if [ -n "$target" ] && command -v "$LLMUX_BIN" >/dev/null 2>&1; then
+    # Cached per resolved executable + target (failures too, so a dead daemon
+    # is asked once per TTL, not once per refresh of every session).
+    cached fleet "$LLMUX_KEY" "$fleet_hash" fleet_fetch "${1:-}"
+    daemon_port="$C_A"; fleet_tuple="$C_B"; FLEET_TS="$C_SRC_TS"
+    if [ "$target" = "local" ]; then
+      # Guard: the local daemon we asked must be the one the session points at.
+      url_port="${ANTHROPIC_BASE_URL#*://}"; url_port="${url_port%%/*}"
+      case "$url_port" in *:*) url_port="${url_port##*:}" ;; *) url_port=3456 ;; esac
+      [ "$daemon_port" = "$url_port" ] || fleet_tuple=""
+    fi
+    if [ -n "$fleet_tuple" ]; then
+      read -r cl_n cl5 cl7 clf cl_rs cx_n cx7 cx_rs <<< "$fleet_tuple"
+      # A cached answer is C_AGE seconds old: move its countdowns forward.
+      if [ "$C_AGE" -gt 0 ]; then
+        is_int "${cl_rs:-}" && cl_rs=$((cl_rs - C_AGE))
+        is_int "${cx_rs:-}" && cx_rs=$((cx_rs - C_AGE))
+      fi
+      if [ -n "${cl_n:-}" ]; then
+        if [ "$cl_n" -gt 0 ] 2>/dev/null; then
+          pct_paint "$cl5" "$cl_n"; c5="$PC"
+          pct_paint "$cl7" "$cl_n"; c7="$PC"
+          pct_paint "$clf" "$cl_n"; cf="$PC"
+          reset_span "${cl_rs:-}"
+          rate_seg="${MAGENTA}CLD(${cl_n})${RESET} ${DIM}5h:${RESET} ${c5}${cl5}%${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}${RS}"
+        fi
+        if [ "$cx_n" -gt 0 ] 2>/dev/null; then
+          pct_paint "$cx7" "$cx_n"
+          reset_span "${cx_rs:-}"
+          cdx="${CYAN}CDX(${cx_n})${RESET} ${DIM}7d:${RESET} ${PC}${cx7}%${RESET}${RS}"
+          if [ -n "$rate_seg" ]; then rate_seg="${rate_seg}${DIM} | ${RESET}${cdx}"; else rate_seg="$cdx"; fi
+        fi
+      fi
     fi
   fi
-  parts=()
-  if [ -n "${u5:-}" ] && [ "$u5" != "-" ]; then
-    if [ "$j_rem7" = "?" ]; then
-      rem5=$(exec awk -v u="$u5" -v r7="${rem7:-100}" 'BEGIN{
-        r=100-u; if (r<0) r=0; cap=5*r7; if (r>cap) r=cap; printf "%d", r }')
-    else
-      rem5="$j_rem5"
+  # Fallback (no llmux, daemon down, port mismatch, parse failure): the
+  # session's own windows as reported by Claude Code, in REMAINING terms with
+  # the same coupling cap (rem5h_eff = min(rem5h, 5*rem7d)). The harness
+  # currently reports only five_hour and seven_day; a fable weekly window is
+  # picked up automatically if it ever appears. Never an error.
+  if [ -z "$rate_seg" ]; then
+    read -r u5 r5at u7 r7at uf <<< "$rl_tuple"
+    rem7=""
+    if [ -n "${u7:-}" ] && [ "$u7" != "-" ]; then
+      if [ "$j_rem7" = "?" ]; then
+        rem7=$(exec awk -v u="$u7" 'BEGIN{ r=100-u; if (r<0) r=0; printf "%d", r }')
+      else
+        rem7="$j_rem7"
+      fi
     fi
-    pct_paint "$rem5" 1
-    seg5="${DIM}5h:${RESET} ${PC}${rem5}%${RESET}"
-    if [ "$r5at" != "-" ] && [ -n "$r5at" ]; then
-      reset_at_span "$r5at"
-      seg5="${seg5}${RS}"
+    parts=()
+    if [ -n "${u5:-}" ] && [ "$u5" != "-" ]; then
+      if [ "$j_rem7" = "?" ]; then
+        rem5=$(exec awk -v u="$u5" -v r7="${rem7:-100}" 'BEGIN{
+          r=100-u; if (r<0) r=0; cap=5*r7; if (r>cap) r=cap; printf "%d", r }')
+      else
+        rem5="$j_rem5"
+      fi
+      pct_paint "$rem5" 1
+      seg5="${DIM}5h:${RESET} ${PC}${rem5}%${RESET}"
+      if [ "$r5at" != "-" ] && [ -n "$r5at" ]; then
+        reset_at_span "$r5at"
+        seg5="${seg5}${RS}"
+      fi
+      parts+=("$seg5")
     fi
-    parts+=("$seg5")
+    if [ -n "$rem7" ]; then
+      pct_paint "$rem7" 1
+      seg7="${DIM}7d:${RESET} ${PC}${rem7}%${RESET}"
+      if [ "$r7at" != "-" ] && [ -n "$r7at" ]; then
+        # same urgency/blink rules as the fleet segment — common to both modes
+        reset_at_span "$r7at"
+        seg7="${seg7}${RS}"
+      fi
+      parts+=("$seg7")
+    fi
+    if [ -n "${uf:-}" ] && [ "$uf" != "-" ]; then
+      if [ "$j_rem7" = "?" ]; then
+        remf=$(exec awk -v u="$uf" -v r7="${rem7:-100}" 'BEGIN{
+          r=100-u; if (r<0) r=0; cap=2*r7; if (r>cap) r=cap; printf "%d", r }')
+      else
+        remf="$j_remf"
+      fi
+      pct_paint "$remf" 1
+      parts+=("${DIM}7df:${RESET} ${PC}${remf}%${RESET}")
+    fi
+    [ ${#parts[@]} -gt 0 ] && join_parts
   fi
-  if [ -n "$rem7" ]; then
-    pct_paint "$rem7" 1
-    seg7="${DIM}7d:${RESET} ${PC}${rem7}%${RESET}"
-    if [ "$r7at" != "-" ] && [ -n "$r7at" ]; then
-      # same urgency/blink rules as the fleet segment — common to both modes
-      reset_at_span "$r7at"
-      seg7="${seg7}${RS}"
-    fi
-    parts+=("$seg7")
-  fi
-  if [ -n "${uf:-}" ] && [ "$uf" != "-" ]; then
-    if [ "$j_rem7" = "?" ]; then
-      remf=$(exec awk -v u="$uf" -v r7="${rem7:-100}" 'BEGIN{
-        r=100-u; if (r<0) r=0; cap=2*r7; if (r>cap) r=cap; printf "%d", r }')
-    else
-      remf="$j_remf"
-    fi
-    pct_paint "$remf" 1
-    parts+=("${DIM}7df:${RESET} ${PC}${remf}%${RESET}")
-  fi
-  [ ${#parts[@]} -gt 0 ] && join_parts
-fi
+}
+rate_segment
+
+# Invariant 3 at print time: a segment chosen early (a git hit) may have
+# aged past TTL + LOCK_STALE while a later one was slow (llmux). Each such
+# segment is computed again, once, then the line is printed.
+now_s
+is_int "${GIT_TS:-}" && [ $((NOW_T - GIT_TS)) -ge $((CACHE_TTL + LOCK_STALE)) ] && git_segment force
+now_s
+is_int "${FLEET_TS:-}" && [ $((NOW_T - FLEET_TS)) -ge $((CACHE_TTL + LOCK_STALE)) ] && rate_segment force
 
 # --- Assemble one compact line ---
 segments=("$model_seg" "$ctx" "${BLUE}${dir_display}${RESET}" "$git_seg")

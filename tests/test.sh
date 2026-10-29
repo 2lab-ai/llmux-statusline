@@ -210,19 +210,31 @@ CD="$LLMUX_STATUSLINE_CACHE_DIR/interleave"
 
 stamp() { sed "1s/.*/$1/" "$f" > "$f.t" && mv "$f.t" "$f"; } # entry with data read at $1
 
-# (a) Superseded refresher whose data is OLDER than the entry now there: its
-#     lock was broken, the new holder published data read later. Dropped.
+put_entry() { # $1 = ts, $2 = summary tuple: a valid entry with other data
+  { echo "$1"; sed -n '2,4p' "$f"; echo "$2"; echo end; } > "$f.t" && mv "$f.t" "$f"
+}
+OTHER="9 900 900 900 61800 1 75 1030"
+
+# (a) Equal data time (same second): the lock breaks the tie. The holder
+#     publishes over an entry stamped the same second; a run whose lock was
+#     taken over does not. (Same-second stamps are what a fixed clock really
+#     represents; different-second ordering is tested on the real clock below.)
 bg_refresh 1015
 held=$(cat "$f.lock/owner")
-lock_as 1020.1.1
-stamp 1020
+put_entry 1015 "$OTHER"
 : > "$SIG/go"; wait "$BG_PID"
 expect_eq       "refresher held the lock while blocked" "${held%%.*}" 1015
-expect_eq       "late publisher with older data: newer entry kept" "$(head -n 1 "$f")" 1020
-expect_eq       "late publisher with older data: staging file dropped" "$(ls "$CD" | grep -c '\.tmp\.')" 0
-expect_eq       "late publisher: the new holder's lock left alone" "$(cat "$f.lock/owner")" 1020.1.1
-expect_contains "late publisher: the run still shows its own fresh value" "$(sed "$STRIP" "$SIG/out")" "CDX(1) 7d: 75% ↻17m10s"
-expect_eq       "late publisher: no stderr" "$(cat "$SIG/err")" ""
+expect_eq       "tie, lock holder: publishes" "$(head -n 1 "$f")|$(sed -n 5p "$f" | cut -d' ' -f1)" "1015|3"
+expect_eq       "tie, lock holder: lock released, staging gone" "$(ls "$CD" | grep -c '\.lock$\|\.tmp\.')" 0
+stamp 1000
+bg_refresh 1015
+lock_as 1015.1.1
+put_entry 1015 "$OTHER"
+: > "$SIG/go"; wait "$BG_PID"
+expect_eq       "tie, lock taken over: does not publish" "$(head -n 1 "$f")|$(sed -n 5p "$f")" "1015|$OTHER"
+expect_eq       "tie, lock taken over: staging dropped, other holder's lock left alone" "$(ls "$CD" | grep -c '\.tmp\.'),$(cat "$f.lock/owner")" "0,1015.1.1"
+expect_contains "tie, lock taken over: the run still shows its own fresh value" "$(sed "$STRIP" "$SIG/out")" "CDX(1) 7d: 75% ↻17m10s"
+expect_eq       "tie, lock taken over: no stderr" "$(cat "$SIG/err")" ""
 
 # (b) Superseded refresher whose data is NEWER than the entry: publishes.
 rm -rf "$f.lock"; stamp 1000
@@ -257,6 +269,31 @@ run_cached 1085 >/dev/null
 expect_eq       "killed holder's lock 30 s old: expired, refreshed" "$(calls)" $((before + 1))
 expect_eq       "killed holder's lock expired: republished, lock released" "$(head -n 1 "$f"),$(locks)" "1085,0"
 STUB="$FAST_STUB"
+
+# Newest data wins on the real clock: the lock holder read llmux, then (while
+# it parses: a jq stub blocks the fleet parse) another run publishes data
+# read 2 s later. The holder's older data must not replace it.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/newest-real"
+JQB="$(mktemp -d)"; JQSIG="$(mktemp -d)"
+printf '#!/bin/bash\nif [ "$1" = -r ]; then : > "%s/started"; n=0; while [ ! -e "%s/go" ] && [ $n -lt 400 ]; do sleep 0.05; n=$((n+1)); done; fi\nexec %s "$@"\n' \
+  "$JQSIG" "$JQSIG" "$(command -v jq)" > "$JQB/jq"
+chmod +x "$JQB/jq"
+FS2="$(mktemp -d)/llmux"
+printf '#!/bin/bash\ncat "%s"\n' "$PWD/fixture-coupling.json" > "$FS2"
+chmod +x "$FS2"
+echo "$INPUT" > "$JQSIG/in"
+PATH="$JQB:$PATH" ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$FS2" \
+  LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" < "$JQSIG/in" > "$JQSIG/out" 2> "$JQSIG/err" &
+pid=$!
+wait_for "$JQSIG/started"
+sleep 2
+lk=$(ls -d "$CD"/fleet-*.lock); f="${lk%.lock}"
+T1=$(date +%s)
+printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$T1" llmux-statusline-fleet-v1 "$FS2|local" 3456 "$OTHER" end > "$f.new" && mv "$f.new" "$f"
+: > "$JQSIG/go"; wait "$pid" || true
+expect_eq "real clock: lock holder with older data keeps the newer entry" "$(head -n 1 "$f")|$(sed -n 5p "$f")" "$T1|$OTHER"
+expect_eq "real clock: lock holder released its lock, dropped its staging" "$(ls "$CD" | grep -c '\.lock$\|\.tmp\.')" 0
+expect_eq "real clock: no stderr" "$(cat "$JQSIG/err")" ""
 
 # Read-only cache dir after one write: stale entry served while bounded,
 # then computed inline; never an error, nothing written.
@@ -475,5 +512,28 @@ out=$(echo '{"model":{"display_name":"T"},"workspace":{"current_dir":"'"$REPO2"'
 cdx="${out##*CDX(1) 7d: 75% ↻}"; m="${cdx%%m*}"; sec="${cdx#*m}"; sec="${sec%%s*}"
 aged=$((1030 - (m * 60 + sec)))
 expect_eq "fleet hit after a 3 s git refresh: aged by post-git time (>= 2 s)" "$([ "$aged" -ge 2 ] && [ "$aged" -lt 100 ] && echo ok || echo "aged $aged s: $out")" ok
+
+# Invariant 3 at print time (real clock; TTL 3 s + LOCK_STALE 1 s = a 4 s
+# bound): a git hit is chosen first, then an llmux call takes 5 s. The git
+# segment would be printed 5 s old, so it is computed again before printing.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/printbound"
+REPO3="$(mktemp -d)"
+git -C "$REPO3" init -q -b main
+git -C "$REPO3" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+FA="$(mktemp -d)/llmux"; FB="$(mktemp -d)/llmux"
+printf '#!/bin/bash\ncat "%s"\n' "$PWD/fixture-coupling.json" > "$FA"
+printf '#!/bin/bash\nsleep 5\ncat "%s"\n' "$PWD/fixture-coupling.json" > "$FB"
+chmod +x "$FA" "$FB"
+run3() { # $1 = llmux stub
+  echo '{"model":{"display_name":"T"},"workspace":{"current_dir":"'"$REPO3"'"}}' \
+    | ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$1" LLMUX_STATUSLINE_CACHE_TTL=3 \
+      LLMUX_STATUSLINE_LOCK_STALE=1 LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" 2>"$err" | sed "$STRIP"
+  if [ -s "$err" ]; then echo "STDERR: $(cat "$err")"; fi
+}
+expect_contains "print-time bound: setup run sees a clean repo" "$(run3 "$FA")" "| main |"
+echo change > "$REPO3/file"
+out=$(run3 "$FB")
+expect_contains "print-time bound: git hit computed again after a 5 s llmux call" "$out" "| main* |"
+expect_contains "print-time bound: fleet segment shown" "$out" "$FLEET"
 
 exit $fail
