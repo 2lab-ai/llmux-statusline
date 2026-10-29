@@ -120,8 +120,11 @@ built to start as few processes as possible. With a warm cache a refresh starts
 `bash` plus one `jq`. One session per cwd and per llmux daemon refreshes the cache;
 the others reuse it. The git segment can therefore lag the working tree by up to
 the TTL. While another session is refreshing, an expired entry may be shown for
-up to TTL + 30 s, after which a session computes the value itself; this bound
-is checked again just before the line is printed. The llmux
+up to TTL + 30 s, after which a session computes the value itself. A cached
+value is never printed once it is that old: the age is checked again just
+before printing, and an expired value is recomputed once. A value computed
+during the run itself can still age while the run waits on other work (for
+example a slow llmux call), exactly as in the uncached original. The llmux
 countdowns are aged from the moment llmux answered, so they stay accurate to
 about a second. The cache is used only in a directory owned by you; a foreign
 or symlinked directory just turns it off. The default directory is created

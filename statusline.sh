@@ -182,8 +182,10 @@ now_s() { # -> NOW_T = wall clock now, no fork (+-1 s)
 # INVARIANT (the contract every change here must keep):
 #   1. A published entry is always complete.
 #   2. Its timestamp truthfully records when its data was read.
-#   3. A value is never shown once its age is >= TTL + LOCK_STALE (checked when
-#      a segment is chosen, and again for every segment right before printing).
+#   3. A value taken from the cache is never shown once its age at print time
+#      is >= TTL + LOCK_STALE; it is recomputed once instead. A value computed
+#      during this run may age by this run's own blocking work before printing
+#      -- exactly as in main, which also computed git before a slow llmux call.
 # The refresh lock is advisory: it only spares duplicate refreshes. The
 # windows between an owner/age check and the mv/rm that follows are accepted:
 # their only possible effects are a duplicate refresh or, briefly, an older
