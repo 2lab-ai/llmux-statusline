@@ -168,6 +168,53 @@ expect_eq       "dead lock (40 s old) broken: recomputed" "$(calls)" $((before +
 expect_eq       "dead lock broken: entry republished at 1030" "$(head -n 1 "$f")" 1030
 expect_eq       "dead lock broken: lock released" "$(ls "$CD" | grep -c '\.lock$')" 0
 
+# A real race: 20 sessions refresh one expired entry at the same moment
+# (llmux answers slowly). One refreshes; the rest serve the stale entry.
+# Tolerance 2: a racer that reads the lock between its O_EXCL create and its
+# ts write treats it as dead and refreshes too. Breaking an unreadable lock
+# is deliberate: honoring it could wedge the cache if a holder died there.
+race() { # $1 = NOW; 20 concurrent runs -> $RD/out.*
+  local i
+  rm -f "$RD"/out.*
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    run_cached "$1" > "$RD/out.$i" &
+  done
+  wait
+}
+all_render() { # every concurrent output is the full, error-free line
+  local f
+  for f in "$RD"/out.*; do
+    [[ "$(cat "$f")" == *"$FLEET"* && "$(cat "$f")" != *STDERR:* ]] || return 1
+  done
+}
+RD="$(mktemp -d)"
+STUB="$(mktemp -d)/llmux"
+printf '#!/bin/bash\necho call >> "%s"\nsleep 0.5\ncat "%s"\n' "$COUNTER" "$PWD/fixture-coupling.json" > "$STUB"
+chmod +x "$STUB"
+CD="$LLMUX_STATUSLINE_CACHE_DIR/race"
+run_cached 5000 >/dev/null
+before=$(calls)
+race 5020
+got=$(( $(calls) - before ))
+expect_eq "race on an expired entry: 1-2 refreshes, not 20" "$([ "$got" -ge 1 ] && [ "$got" -le 2 ] && echo ok || echo "$got calls")" ok
+expect_eq "race on an expired entry: every session renders" "$(all_render && echo ok)" ok
+run_cached 5021 >/dev/null
+f=$(fleet_file)
+expect_eq "race on an expired entry: valid entry afterwards" "$(tail -n 1 "$f"),$(ls "$CD" | grep -c '\.lock$')" "end,0"
+# Cold start (fresh install, reboot that wiped the cache): no entry to serve,
+# so every racer computes once; one publishes.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/race-cold"
+before=$(calls)
+race 6000
+expect_eq "cold-start race: each session computes once" "$(( $(calls) - before ))" 20
+expect_eq "cold-start race: every session renders" "$(all_render && echo ok)" ok
+run_cached 6001 >/dev/null
+f=$(fleet_file)
+expect_eq "cold-start race: valid entry afterwards" "$(tail -n 1 "$f"),$(ls "$CD" | grep -c '\.lock$')" "end,0"
+STUB="$(mktemp -d)/llmux"
+printf '#!/bin/bash\necho call >> "%s"\ncat "%s"\n' "$COUNTER" "$PWD/fixture-coupling.json" > "$STUB"
+chmod +x "$STUB"
+
 # TTL=0 turns caching off: every run asks llmux, nothing is written.
 CD="$LLMUX_STATUSLINE_CACHE_DIR/ttl0"
 before=$(calls)
