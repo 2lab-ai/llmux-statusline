@@ -276,11 +276,12 @@ publish() {
 # another run holds the lock, a stale entry is served, but only while it is
 # younger than TTL + LOCK_STALE; past that this run computes inline.
 # C_AGE = age in seconds of what is served, C_SRC_TS = when its data was
-# read. <compute-fn> sets C_TS_NEW to that time (default: now).
+# read, C_COMPUTED = 1 if <compute-fn> ran in this run (0: from the cache).
+# <compute-fn> sets C_TS_NEW to when its data was read (default: now).
 cached() {
   local file="$CACHE_DIR/$1-$3" magic="llmux-statusline-$1-v1" key="$2" fn="$4" lk age=""
   now_s
-  C_AGE=0; C_TS_NEW="$NOW_T"
+  C_AGE=0; C_TS_NEW="$NOW_T"; C_COMPUTED=1
   if [ "$CACHE_TTL" -eq 0 ] || [ -z "$3" ]; then "$fn"; C_SRC_TS=$C_TS_NEW; return 0; fi
   if [ ! -e "$CACHE_DIR" ] && [ ! -L "$CACHE_DIR" ]; then
     ( umask 077; exec mkdir -p "$CACHE_DIR" ) 2>/dev/null
@@ -293,7 +294,7 @@ cached() {
     # stamped up to 5 s ahead: clock granularity between concurrent runs
     [ "$age" -lt 0 ] && [ "$age" -ge -5 ] && age=0
     if [ "$age" -ge 0 ]; then
-      C_AGE=$age; C_SRC_TS=$C_TS
+      C_AGE=$age; C_SRC_TS=$C_TS; C_COMPUTED=0
       [ "$age" -lt "$CACHE_TTL" ] && return 0
     else
       age="" # from the future: a miss
@@ -301,14 +302,14 @@ cached() {
   fi
   lk="$file.lock"
   if lock_take "$lk" "$age"; then
-    C_AGE=0
+    C_AGE=0; C_COMPUTED=1
     "$fn"; C_SRC_TS=$C_TS_NEW
     publish "$file" "$lk" "$magic" "$key"
     lock_owned "$lk" && rm -rf "$lk" 2>/dev/null
     return 0
   fi
   [ -n "$age" ] && [ "$age" -lt $((CACHE_TTL + LOCK_STALE)) ] && return 0 # stale, bounded
-  C_AGE=0
+  C_AGE=0; C_COMPUTED=1
   "$fn"; C_SRC_TS=$C_TS_NEW
   publish "$file" "$lk" "$magic" "$key" # newest data wins
 }
@@ -448,9 +449,9 @@ case "$cwd" in
   /*) case "$git_key" in *$'\n'*) git_hash="" ;; esac ;;
   *) git_hash="" ;;
 esac
-git_segment() { # [force] -> git_seg, GIT_TS (when its data was read)
+git_segment() { # [force] -> git_seg, GIT_TS (when its data was read), GIT_RAN
   cached git "$git_key" "$git_hash" git_compute "${1:-}"
-  git_seg="$C_A"; GIT_TS="$C_SRC_TS"
+  git_seg="$C_A"; GIT_TS="$C_SRC_TS"; GIT_RAN="$C_COMPUTED"
 }
 git_segment
 
@@ -592,8 +593,8 @@ fleet_fetch() { # -> C_A = daemon port, C_B = summary tuple (both empty: no usab
 }
 
 join_parts() { local IFS=' '; rate_seg="${parts[*]}"; }
-rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read; "" = not asked)
-  rate_seg=""; FLEET_TS=""
+rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read; "" = not asked), FLEET_RAN
+  rate_seg=""; FLEET_TS=""; FLEET_RAN=1
   # Clock for this segment (blink phase, payload countdowns): read after the
   # git work, as the original script's `date` call was.
   now_s; NOW_R=$NOW_T
@@ -601,7 +602,7 @@ rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read
     # Cached per resolved executable + target (failures too, so a dead daemon
     # is asked once per TTL, not once per refresh of every session).
     cached fleet "$LLMUX_KEY" "$fleet_hash" fleet_fetch "${1:-}"
-    daemon_port="$C_A"; fleet_tuple="$C_B"; FLEET_TS="$C_SRC_TS"
+    daemon_port="$C_A"; fleet_tuple="$C_B"; FLEET_TS="$C_SRC_TS"; FLEET_RAN="$C_COMPUTED"
     if [ "$target" = "local" ]; then
       # Guard: the local daemon we asked must be the one the session points at.
       url_port="${ANTHROPIC_BASE_URL#*://}"; url_port="${url_port%%/*}"
@@ -688,13 +689,22 @@ rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read
 }
 rate_segment
 
-# Invariant 3 at print time: a segment chosen early (a git hit) may have
-# aged past TTL + LOCK_STALE while a later one was slow (llmux). Each such
-# segment is computed again, once, then the line is printed.
-now_s
-is_int "${GIT_TS:-}" && [ $((NOW_T - GIT_TS)) -ge $((CACHE_TTL + LOCK_STALE)) ] && git_segment force
-now_s
-is_int "${FLEET_TS:-}" && [ $((NOW_T - FLEET_TS)) -ge $((CACHE_TTL + LOCK_STALE)) ] && rate_segment force
+# Invariant 3 at print time: a value taken from the cache may have aged past
+# TTL + LOCK_STALE while this run did slow work after choosing it (llmux, or
+# recomputing the other segment). Until no cached value is expired at the
+# current time, recompute the expired one. A recomputed segment is no longer
+# a cached value, so each segment is recomputed at most once: at most two
+# passes, then print. Builtins only when nothing has expired.
+cached_expired() { # <ts> <ran>: 0 = a cached value at least TTL + LOCK_STALE old now
+  [ "$2" = 0 ] && is_int "$1" && [ $((NOW_T - $1)) -ge $((CACHE_TTL + LOCK_STALE)) ]
+}
+while :; do
+  now_s
+  if cached_expired "${GIT_TS:-}" "${GIT_RAN:-1}"; then git_segment force
+  elif cached_expired "${FLEET_TS:-}" "${FLEET_RAN:-1}"; then rate_segment force
+  else break
+  fi
+done
 
 # --- Assemble one compact line ---
 segments=("$model_seg" "$ctx" "${BLUE}${dir_display}${RESET}" "$git_seg")

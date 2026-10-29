@@ -536,4 +536,71 @@ out=$(run3 "$FB")
 expect_contains "print-time bound: git hit computed again after a 5 s llmux call" "$out" "| main* |"
 expect_contains "print-time bound: fleet segment shown" "$out" "$FLEET"
 
+# Invariant 3 is a fixpoint over the segments: recomputing one segment can
+# push a cached value of the other past the bound, which is then recomputed
+# too (each at most once). Real clock, TTL 3 s + LOCK_STALE 3 s = a 6 s bound;
+# every delay keeps >= 2 s from a boundary (ages are whole seconds, +-1 each
+# side). The time between choosing a segment and the final check is made by
+# the fleet render: a reset with a fraction takes the awk path, and a PATH
+# awk stub takes 3 s.
+FLOATC="$(mktemp)"; FLOATF="$(mktemp)"
+FRAC='(.accounts[] | select(.group == "claude") | .seven_day.resets_in_secs) |= (if . == null then . else . + 0.5 end)'
+jq "$FRAC" fixture-coupling.json > "$FLOATC"
+jq "$FRAC" fixture-fleet.json > "$FLOATF"
+SLOWAWK="$(mktemp -d)"
+printf '#!/bin/bash\nsleep 3\nexec %s "$@"\n' "$(command -v awk)" > "$SLOWAWK/awk"
+SLOWGIT5="$(mktemp -d)"
+printf '#!/bin/bash\n[ "$4" = diff ] && sleep 5\nexec %s "$@"\n' "$(command -v git)" > "$SLOWGIT5/git"
+FX="$(mktemp -d)" # flags: slow = llmux takes 3 s, new = llmux answers the other fleet
+FL="$(mktemp -d)/llmux"
+printf '#!/bin/bash\n[ -e "%s/slow" ] && sleep 3\nif [ -e "%s/new" ]; then cat "%s"; else cat "%s"; fi\n' \
+  "$FX" "$FX" "$FLOATF" "$FLOATC" > "$FL"
+chmod +x "$SLOWAWK/awk" "$SLOWGIT5/git" "$FL"
+REPO5="$(mktemp -d)"
+git -C "$REPO5" init -q -b main
+git -C "$REPO5" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+run5() { # $1 = PATH prefix ("" = none)
+  echo '{"model":{"display_name":"T"},"workspace":{"current_dir":"'"$REPO5"'"}}' \
+    | PATH="$1$PATH" ANTHROPIC_BASE_URL=http://localhost:3456 LLMUX_STATUSLINE_BIN="$FL" \
+      LLMUX_STATUSLINE_CACHE_TTL=3 LLMUX_STATUSLINE_LOCK_STALE=3 LLMUX_STATUSLINE_CACHE_DIR="$CD" \
+      bash "$SCRIPT" 2>"$err" | sed "$STRIP"
+  if [ -s "$err" ]; then echo "STDERR: $(cat "$err")"; fi
+}
+entry_of() { local e; for e in "$CD/$1"-*; do case "$e" in *.lock|*.tmp.*) ;; *) printf '%s' "$e" ;; esac; done; }
+aged_by() { sed "1s/.*/$(( $(date +%s) - $2 ))/" "$1" > "$1.t" && mv "$1.t" "$1"; } # entry, seconds
+live_lock() { rm -rf "$1.lock"; mkdir "$1.lock"; printf '%s.1.1\n' "$(date +%s)" > "$1.lock/owner"; }
+COUP_SUMS="CLD(3) 5h: 150% 7d: 110% 7df: 120%"
+FLEET_SUMS="CLD(3) 5h: 150% 7d: 150% 7df: 150%"
+
+# (a) git: a hit. fleet: 4 s old (stale), another run holds its lock, so it
+#     is served from the cache; the 3 s render pushes it past 6 s. Its forced
+#     refresh takes 3 s + 3 s render, which pushes the cached git past 6 s:
+#     git must be recomputed as well (a single pass printed it 9 s old).
+CD="$LLMUX_STATUSLINE_CACHE_DIR/fixpoint-a"
+run5 "" >/dev/null
+echo change > "$REPO5/file" # a recomputed git segment shows "main*"
+fe=$(entry_of fleet)
+aged_by "$fe" 4
+live_lock "$fe"
+: > "$FX/slow"
+out=$(run5 "$SLOWAWK:")
+rm -f "$FX/slow"
+expect_contains "fixpoint (a): cached git recomputed after the forced fleet refresh" "$out" "| main* |"
+expect_contains "fixpoint (a): fleet shown" "$out" "$COUP_SUMS"
+
+# (b) Mirror: fleet a hit; git 4 s old (stale), lock held elsewhere, served
+#     from the cache; the 3 s render pushes it past 6 s, its forced refresh
+#     takes 5 s (git stub), which pushes the cached fleet past 6 s: the fleet
+#     must be recomputed (llmux now answers the other fleet).
+CD="$LLMUX_STATUSLINE_CACHE_DIR/fixpoint-b"
+run5 "" >/dev/null
+ge=$(entry_of git)
+aged_by "$ge" 4
+live_lock "$ge"
+: > "$FX/new"
+out=$(run5 "$SLOWAWK:$SLOWGIT5:")
+rm -f "$FX/new"
+expect_contains "fixpoint (b): cached fleet recomputed after the forced git refresh" "$out" "$FLEET_SUMS"
+
 exit $fail
+
