@@ -398,4 +398,17 @@ expect_contains "git hit inside TTL: cached clean segment" "$out" "| main"
 [[ "$out" == *"main*"* ]] && { echo "FAIL git hit served a recomputed segment"; fail=1; }
 expect_contains "git expiry: change visible" "$(run_git 3010)" "| main*"
 
+# The git entry is stamped when git was read, not when the run started, so a
+# refresh slower than the TTL still yields a fresh entry (real clock; a git
+# stub makes `git diff` take 3 s).
+SLOWGIT="$(mktemp -d)"
+printf '#!/bin/bash\n[ "$4" = diff ] && sleep 3\nexec %s "$@"\n' "$(command -v git)" > "$SLOWGIT/git"
+chmod +x "$SLOWGIT/git"
+CDG="$LLMUX_STATUSLINE_CACHE_DIR/slowgit"
+t0=$(date +%s)
+echo "$GITIN" | PATH="$SLOWGIT:$PATH" ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent \
+  LLMUX_STATUSLINE_CACHE_DIR="$CDG" bash "$SCRIPT" >/dev/null 2>"$err"
+ts=$(head -n 1 "$CDG"/git-*)
+expect_eq "git entry stamped when git was read (>= start + 2 s)" "$([ $((ts - t0)) -ge 2 ] && echo ok || echo "ts-start=$((ts - t0))")" ok
+
 exit $fail

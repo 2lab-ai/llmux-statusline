@@ -401,6 +401,9 @@ git_compute() { # -> C_A = rendered git segment
     fi
   fi
   C_A="${git_color}${branch}${dirty}${RESET}${ab_str}${diff_seg}"
+  # stamped when read, not when the run started: a refresh slower than the
+  # TTL would otherwise publish an already-expired entry and refresh nonstop
+  now_s; C_TS_NEW=$NOW_T
 }
 # Cached per cwd (+ GIT_DIR/GIT_WORK_TREE), only for an absolute, single-line
 # cwd: a relative one depends on the caller's own working directory.
