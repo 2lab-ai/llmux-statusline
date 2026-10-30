@@ -192,13 +192,15 @@ now_s() { # -> NOW_T = wall clock now, no fork (+-1 s)
 # but truthfully stamped entry replacing a newer one.
 #
 # One entry file per key: ts, magic, key, A, B, "end", one per line. Every
-# computing run writes its own staging file and publishes it with one `mv`
-# (atomic rename) when it holds the lock or its data is newer than what is
-# there (newest data wins). Only regular files are read; anything else, or
-# anything that does not parse, is a miss. The lock (<entry>.lock) is a
-# directory holding the owner's token "<ts>.<pid>.<random>". The cache is used
-# only in a real directory owned by this user. Ages are taken at the moment
-# of each decision (now_s), not at script start.
+# computing run writes its own staging file (<entry>.tmp.<ts>.<pid>.<random>)
+# and publishes it with one `mv` (atomic rename) when it holds the lock or its
+# data is newer than what is there (newest data wins). A run killed before its
+# mv/rm leaves the staging file: the lock holder removes it once LOCK_STALE old.
+# Only regular files are read; anything else, or anything that does not
+# parse, is a miss. The lock (<entry>.lock) is a directory holding the owner's
+# token "<ts>.<pid>.<random>". The cache is used only in a real directory
+# owned by this user. Ages are taken at the moment of each decision (now_s),
+# not at script start.
 is_file() { [ -f "$1" ] && [ ! -L "$1" ]; } # never open a FIFO, device or symlink
 
 cache_get() { # <file> <magic> <key> -> C_TS C_A C_B; 0 = well-formed entry
@@ -258,7 +260,8 @@ lock_take() { # <lockdir> <entry age, "" = no entry>: 0 = this run holds the loc
 # the lock holder publishes (the lock breaks ties, never beats newer data).
 publish() {
   ( umask 077
-    stage="$1.tmp.$$.$RANDOM"
+    now_s # the stamp in the name is what lets the lock holder sweep it
+    stage="$1.tmp.$NOW_T.$$.$RANDOM"
     { [ -e "$stage" ] || [ -L "$stage" ]; } && exit 1
     set -C
     printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$C_TS_NEW" "$3" "$4" "$C_A" "$C_B" end > "$stage" || exit 1
@@ -269,6 +272,24 @@ publish() {
     fi
     exec rm -f "$stage" # a newer entry is there already
   ) 2>/dev/null
+}
+
+# sweep_stages <file>: remove <file>'s staging files at least LOCK_STALE old
+# (and >= 3 s), left by runs killed between writing and publishing them. Only
+# the lock holder calls it, before its own publish: one sweeper per entry per
+# TTL, and never its own staging file. A younger one may be a live run's.
+# Builtins only, plus one rm when something is to go.
+sweep_stages() {
+  local f ts min="$LOCK_STALE" old=()
+  # each run's clock can lag up to 1 s: a live stage can look up to 2 s old
+  [ "$min" -lt 3 ] && min=3
+  for f in "$1".tmp.*; do # no match: the literal pattern, whose stamp is "*"
+    ts="${f#"$1".tmp.}"; ts="${ts%%.*}"
+    # a legacy <entry>.tmp.<pid>.<random> name reads its pid as the stamp:
+    # ancient, so it goes as well
+    is_int "$ts" && [ $((NOW_T - ts)) -ge "$min" ] && is_file "$f" && old+=("$f")
+  done
+  [ ${#old[@]} -eq 0 ] || rm -f -- "${old[@]}" 2>/dev/null
 }
 
 # cached <name> <key> <hash> <compute-fn> [force]: C_A/C_B from a fresh
@@ -302,6 +323,7 @@ cached() {
   fi
   lk="$file.lock"
   if lock_take "$lk" "$age"; then
+    sweep_stages "$file" # aged by the same NOW_T as the lock
     C_AGE=0; C_COMPUTED=1
     "$fn"; C_SRC_TS=$C_TS_NEW
     publish "$file" "$lk" "$magic" "$key"

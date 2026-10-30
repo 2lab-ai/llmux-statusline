@@ -270,6 +270,87 @@ expect_eq       "killed holder's lock 30 s old: expired, refreshed" "$(calls)" $
 expect_eq       "killed holder's lock expired: republished, lock released" "$(head -n 1 "$f"),$(locks)" "1085,0"
 STUB="$FAST_STUB"
 
+# Staging files of runs killed between writing and publishing them: the next
+# lock holder of that entry removes those at least LOCK_STALE old (a legacy
+# "<entry>.tmp.<pid>.<random>" name reads as ancient). A younger one may belong
+# to a live run; a symlink or a FIFO is never touched.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/sweep"
+run_cached 9000 >/dev/null; f=$(fleet_file)
+present() { # suffixes of "$f.tmp.<suffix>" -> those still there
+  local s r=""
+  for s in "$@"; do if [ -e "$f.tmp.$s" ] || [ -L "$f.tmp.$s" ]; then r="$r $s"; fi; done
+  printf '%s' "${r# }"
+}
+SENTINEL="$(mktemp)"; printf 'SENTINEL\n' > "$SENTINEL"
+for s in 8979.1.1 8980.1.1 123.456 8981.1.1 9010.1.1; do cp "$f" "$f.tmp.$s"; done
+ln -s "$SENTINEL" "$f.tmp.8979.2.2"
+mkfifo "$f.tmp.8979.3.3"
+before=$(calls)
+run_cached 9010 >/dev/null
+expect_eq "sweep: the run took the lock and refreshed, no stderr" \
+  "$(calls),$(head -n 1 "$f"),$(locks),$(cat "$err")" "$((before + 1)),9010,0,"
+expect_eq "sweep: 31 s, 30 s and legacy staging removed; 29 s and fresh kept" \
+  "$(present 8979.1.1 8980.1.1 123.456 8981.1.1 9010.1.1)" "8981.1.1 9010.1.1"
+expect_eq "sweep: stale-named symlink left in place, target untouched" \
+  "$([ -L "$f.tmp.8979.2.2" ] && echo link),$(cat "$SENTINEL")" "link,SENTINEL"
+expect_eq "sweep: stale-named FIFO left in place" "$([ -p "$f.tmp.8979.3.3" ] && echo fifo)" fifo
+# Only the lock holder sweeps: a cache hit leaves a stale one alone; the next
+# refresh removes it.
+cp "$f" "$f.tmp.8000.1.1"
+before=$(calls)
+run_cached 9015 >/dev/null
+expect_eq "sweep: a cache hit takes no lock and removes nothing" "$(calls),$(present 8000.1.1)" "$before,8000.1.1"
+run_cached 9020 >/dev/null
+expect_eq "sweep: the next lock holder removes it" "$(calls),$(present 8000.1.1)" "$((before + 1)),"
+
+# Process budget: rm and mv stubs first on PATH log every call (the script
+# runs both by name). A cache hit runs neither, even with stale staging files
+# there; a lock holder with nothing to sweep runs only its publish mv and its
+# lock rm; N stale staging files cost one extra rm, not N. The publisher's
+# staging file is named <entry>.tmp.<now>.<pid>.<random>.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/budget"
+LOGBIN="$(mktemp -d)"; LOGF="$(mktemp)"
+for c in rm mv; do
+  { echo '#!/bin/bash'
+    echo "{ printf '%s' $c; printf ' %s' \"\$@\"; echo; } >> \"$LOGF\""
+    echo "exec /bin/$c \"\$@\""
+  } > "$LOGBIN/$c"
+  chmod +x "$LOGBIN/$c"
+done
+logged() { # $1 = NOW -> every rm/mv call of the run, one per line
+  : > "$LOGF"
+  PATH="$LOGBIN:$PATH" run_cached "$1" >/dev/null
+  cat "$LOGF"
+}
+on_entry() { # $1 = log -> NORM: its calls bar those on the git entry, ";"-joined, the fleet staging name as <stage>; MV = the raw mv line
+  local l
+  NORM=""; MV=""
+  while IFS= read -r l; do
+    case "$l" in ''|*"$CD/git-"*) continue ;; esac
+    case "$l" in "mv -f $f.tmp."*" $f") MV="$l"; l="mv -f <stage> $f" ;; esac
+    NORM="$NORM$l;"
+  done <<< "$1"
+}
+run_cached 9100 >/dev/null; f=$(fleet_file)
+L=$(logged 9110); on_entry "$L"
+expect_eq "budget: lock holder, nothing to sweep: publish mv and lock rm only" "$NORM,$(cat "$err")" "mv -f <stage> $f;rm -rf $f.lock;,"
+expect_eq "budget: the publisher's staging file is <entry>.tmp.<now>.<pid>.<random>" \
+  "$([[ $MV =~ ^"mv -f $f.tmp.9110."[0-9]+\.[0-9]+" $f"$ ]] && echo ok || echo "$MV")" ok
+for s in 77.88 9000.1.1 9001.1.1; do cp "$f" "$f.tmp.$s"; done
+L=$(logged 9115)
+expect_eq "budget: cache hit with stale staging files there: no rm, no mv" "$L,$(present 77.88 9000.1.1 9001.1.1),$(cat "$err")" ",77.88 9000.1.1 9001.1.1,"
+L=$(logged 9120); on_entry "$L"
+expect_eq "budget: lock holder with 3 stale staging files: one rm for all 3" "$NORM,$(cat "$err")" \
+  "rm -f -- $f.tmp.77.88 $f.tmp.9000.1.1 $f.tmp.9001.1.1;mv -f <stage> $f;rm -rf $f.lock;,"
+
+# The sweep waits at least 3 s even with LOCK_STALE=1: each run's clock can
+# lag up to 1 s, so a live run's staging file can look up to 2 s old.
+CD="$LLMUX_STATUSLINE_CACHE_DIR/floor"
+run_cached 9200 >/dev/null; f=$(fleet_file)
+for s in 9207.1.1 9208.1.1; do cp "$f" "$f.tmp.$s"; done
+LLMUX_STATUSLINE_LOCK_STALE=1 run_cached 9210 >/dev/null
+expect_eq "sweep floor, LOCK_STALE=1: 2 s old kept, 3 s old removed" "$(head -n 1 "$f"),$(present 9207.1.1 9208.1.1)" "9210,9208.1.1"
+
 # Newest data wins on the real clock: the lock holder read llmux, then (while
 # it parses: a jq stub blocks the fleet parse) another run publishes data
 # read 2 s later. The holder's older data must not replace it.
