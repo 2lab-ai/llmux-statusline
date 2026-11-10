@@ -81,7 +81,7 @@ main() {
   # Smoke render so the user sees it working immediately
   log ""
   log "sample render:"
-  echo '{"model":{"display_name":"Claude"},"effort":{"level":"high"},"fast_mode":false,"context_window":{"used_percentage":10,"remaining_percentage":90,"context_window_size":200000},"workspace":{"current_dir":"'"$HOME"'"},"rate_limits":{"five_hour":{"used_percentage":5}}}' \
+  echo '{"model":{"display_name":"Claude"},"effort":{"level":"high"},"fast_mode":false,"context_window":{"used_percentage":10,"remaining_percentage":90,"context_window_size":200000},"workspace":{"current_dir":"'"$HOME"'"},"rate_limits":{"seven_day":{"used_percentage":5}}}' \
     | bash "$DEST" >&2 || true
   log ""
   log "done. Restart Claude Code (or open a new session) to see it."

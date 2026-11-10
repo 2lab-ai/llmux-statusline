@@ -10,7 +10,7 @@ curl -fsSL https://2lab-ai.github.io/llmux-statusline/install.sh | bash
 One compact line:
 
 ```
-Fable 5 high | ctx 66% left 658k/1.0M | ~/2lab.ai/zbrain | main* ↑5 +313,-120 | CLD(10) 5h: 269% 7d: 212% 7df: 292% | CDX(3) 7d: 243%
+Fable 5 high | ctx 66% left 658k/1.0M | ~/2lab.ai/zbrain | main* ↑5 +313,-120 | CLD(10) 7d: 212% 7df: 292% | CDX(3) 7d: 243%
 ```
 
 ## Segments
@@ -21,7 +21,7 @@ Fable 5 high | ctx 66% left 658k/1.0M | ~/2lab.ai/zbrain | main* ↑5 +313,-120 
 | Context | `ctx 66% left 658k/1.0M` | Remaining context %, colored (green/yellow/red by usage), + remaining/total tokens |
 | Directory | `~/2lab.ai/zbrain` | cwd, `~`-relative, truncated to last 2 components when deep |
 | Git | `main* ↑5 ↓6 +313,-120` | Branch, `*` dirty, ahead/behind upstream, diff line stats vs HEAD (staged+unstaged) |
-| Rate limits | see below | llmux fleet sums, or the session's own 5h window |
+| Rate limits | see below | llmux fleet sums, or the session's own 7d window |
 
 ## The llmux segment (rightmost)
 
@@ -32,17 +32,19 @@ The script detects whether the session is routed through an llmux daemon by look
   and shows **fleet-wide sums** of window utilization per account group:
 
   ```
-  CLD(8) 5h: 375% 7d: 720% 7df: 320% | CDX(2) 7d: 213%
+  CLD(8) 7d: 720% 7df: 320% | CDX(2) 7d: 213%
   ```
 
   - Numbers are **remaining capacity, summed** across accounts: `CLD(8)` = 8 claude
     accounts; 3 accounts with 50% left each shows 150%. Ceiling = N×100%, 0% = fleet
     exhausted.
-  - `5h` and `7df` are effective remaining — the windows are coupled: a full 5h window
-    costs ~20% of the 7d budget and a full 7df (Fable weekly) window ~50% of it, so per
-    account `rem5h_eff = min(rem5h, 5 × rem7d)` and `rem7df_eff = min(rem7df, 2 × rem7d)`.
-    A 7d-exhausted account contributes 0% on all three windows even when its own 5h
-    window looks fresh.
+  - `7df` is effective remaining — the windows are coupled: a full 7df (Fable weekly)
+    window costs ~50% of the 7d budget, so per account `rem7df_eff = min(rem7df, 2 × rem7d)`.
+    A 7d-exhausted account contributes 0% on both windows even when its own 7df window
+    looks fresh.
+  - There is no 5-hour window: no provider reports one since 2026-11, and llmux
+    ([#273](https://github.com/2lab-ai/llmux/pull/273)) no longer sends `five_hour`. A
+    `five_hour` an older daemon still sends is ignored.
   - A **cold** (never-used) account has no window data yet and counts as 100% remaining.
   - **auth-failed** and operator-**paused** accounts serve nothing and are excluded from
     both the sums and the `(N)` count.
@@ -56,21 +58,20 @@ The script detects whether the session is routed through an llmux daemon by look
     CDX cyan) and the percentages use its gauge levels on the fleet average (sum/N) of
     remaining — yellow ≤30%, red ≤10%, green otherwise.
 
-- **Plain Claude session** (no llmux) → the session's own windows as reported by
-  Claude Code, in the same remaining terms, with reset countdowns on both
-  windows:
+- **Plain Claude session** (no llmux) → the session's own weekly window as
+  reported by Claude Code, in the same remaining terms, with its reset countdown:
 
   ```
-  5h: 42% ↻2h30m 7d: 55% ↻3d4h
+  7d: 55% ↻3d4h
   ```
 
-  The 5h coupling cap and the countdown urgency/blink tiers are the same in both
-  modes. The cap applies here too (`rem5h_eff = min(rem5h, 5 × rem7d)`). The
-  harness currently reports only the 5h and 7d windows; a fable weekly window is
-  shown automatically if it ever appears in the payload.
+  The countdown urgency/blink tiers are the same in both modes. A fable weekly
+  window is shown automatically if it ever appears in the payload, with the same
+  coupling cap (`rem7df_eff = min(rem7df, 2 × rem7d)`). A `five_hour` the harness
+  may still send is ignored.
 
 The llmux path is strictly best-effort: no llmux binary, daemon down, a non-llmux
-`ANTHROPIC_BASE_URL`, or a port mismatch all silently fall back to the plain `5h:NN%`
+`ANTHROPIC_BASE_URL`, or a port mismatch all silently fall back to the plain `7d:NN%`
 display — never an error in the statusline.
 
 ## Install
@@ -141,7 +142,7 @@ the script queries it via `llmux status --json --remote host:port`.
 echo '{"model":{"display_name":"Fable 5"},"effort":{"level":"high"},"fast_mode":false,
       "context_window":{"used_percentage":34,"remaining_percentage":66,"context_window_size":1000000},
       "workspace":{"current_dir":"'"$PWD"'"},
-      "rate_limits":{"five_hour":{"used_percentage":12}}}' | bash statusline.sh
+      "rate_limits":{"seven_day":{"used_percentage":45}}}' | bash statusline.sh
 ```
 
 ## License
