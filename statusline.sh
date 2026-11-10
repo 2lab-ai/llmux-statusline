@@ -7,11 +7,14 @@
 #
 # Rate-limit segment (rightmost) is llmux-aware:
 #   - Session routed through llmux (ANTHROPIC_BASE_URL -> llmux daemon):
-#       CLD(8) 5h: 375% 7d: 720% 7df: 320% | CDX(2) 7d: 213%
-#     = SUM of utilization across all llmux accounts per group
-#       (claude: 5h + 7d + 7d-fable windows; codex: 7d only).
-#       3 accounts at 50% each => 150%.
-#   - Direct Anthropic session: the session's own 5h usage (5h:12%).
+#       CLD(8) 7d: 720% 7df: 320% | CDX(2) 7d: 213%
+#     = SUM of remaining capacity across all llmux accounts per group
+#       (claude: 7d + 7d-fable windows; codex: 7d only).
+#       3 accounts with 50% left each => 150%.
+#   - Direct Anthropic session: the session's own 7d window (7d:55%).
+#   There is no 5-hour window (2026-11-10: no provider reports one; llmux
+#   #273 dropped five_hour from its status). A five_hour still sent by an
+#   older daemon or by the harness is ignored.
 #
 # Requirements: jq. llmux CLI only needed for the llmux segment.
 #
@@ -131,19 +134,16 @@ def rem(u; cap): (100 - u) | (if . < 0 then 0 else . end)
 (try f(.workspace.current_dir // .cwd) catch "") as $cwd
 | ($cwd + "\u001f" + $gd + "\u001f" + $gwt) as $gk
 | (try (.rate_limits // {} |
-    [ (.five_hour.used_percentage // "-"),
-      (.five_hour.resets_at // "-"),
-      (.seven_day.used_percentage // "-"),
+    [ (.seven_day.used_percentage // "-"),
       (.seven_day.resets_at // "-"),
       ((.fable_weekly // .seven_day_fable // .seven_day_opus).used_percentage // "-") ])
    catch null) as $t
 | (if $t != null and ($t | all(type == "number" or . == "-")) then
-     ($t[2] | if type == "number" then rem(.; null) else null end) as $r7
+     ($t[0] | if type == "number" then rem(.; null) else null end) as $r7
      | [ $r7,
-         ($t[0] | if type == "number" then rem(.; 5 * ($r7 // 100)) else null end),
-         ($t[4] | if type == "number" then rem(.; 2 * ($r7 // 100)) else null end) ]
+         ($t[2] | if type == "number" then rem(.; 2 * ($r7 // 100)) else null end) ]
      | map(if . == null then "" else tostring end)
-   else ["?", "?", "?"] end) as $rem
+   else ["?", "?"] end) as $rem
 | [ (now | floor | tostring),
     (try f(.model.display_name // "Claude") catch ""),
     (try f(.effort.level // empty) catch ""),
@@ -162,7 +162,7 @@ def rem(u; cap): (100 - u) | (if . < 0 then 0 else . end)
   IFS= read -r -d '' fast; IFS= read -r -d '' win_size; IFS= read -r -d '' usage_sum
   IFS= read -r -d '' used_pct_reported; IFS= read -r -d '' cwd; IFS= read -r -d '' git_key
   IFS= read -r -d '' git_hash; IFS= read -r -d '' fleet_hash; IFS= read -r -d '' rl_tuple
-  IFS= read -r -d '' j_rem7; IFS= read -r -d '' j_rem5; IFS= read -r -d '' j_remf
+  IFS= read -r -d '' j_rem7; IFS= read -r -d '' j_remf
 } < <(exec jq -j --arg gd "${GIT_DIR-}" --arg gwt "${GIT_WORK_TREE-}" \
         --arg lk "$LLMUX_KEY" "$JQ_STDIN" 2>/dev/null)
 
@@ -300,7 +300,9 @@ sweep_stages() {
 # read, C_COMPUTED = 1 if <compute-fn> ran in this run (0: from the cache).
 # <compute-fn> sets C_TS_NEW to when its data was read (default: now).
 cached() {
+  # fleet v2: its tuple lost the 5h sum (2026-11-10), so a v1 entry is a miss, never misread
   local file="$CACHE_DIR/$1-$3" magic="llmux-statusline-$1-v1" key="$2" fn="$4" lk age=""
+  [ "$1" = fleet ] && magic="llmux-statusline-fleet-v2"
   now_s
   C_AGE=0; C_TS_NEW="$NOW_T"; C_COMPUTED=1
   if [ "$CACHE_TTL" -eq 0 ] || [ -z "$3" ]; then "$fn"; C_SRC_TS=$C_TS_NEW; return 0; fi
@@ -478,7 +480,7 @@ git_segment() { # [force] -> git_seg, GIT_TS (when its data was read), GIT_RAN
 git_segment
 
 # --- Rate limits (rightmost): llmux fleet sums when routed through llmux,
-# --- else the session's own 5h usage ---
+# --- else the session's own 7d window ---
 
 
 human_dur() { # $1 = seconds -> HD ("1d2h" / "7h15m" / "15m10s")
@@ -561,14 +563,14 @@ pct_paint() {
 }
 
 # REMAINING capacity per account, summed per group (3 accounts with 50%
-# left each => 150%). Windows are coupled: a full 5h window costs ~20% of
-# 7d, a full 7df window ~50% of 7d, so per account
-#   rem5h_eff  = min(rem5h,  5 * rem7d)
+# left each => 150%). The windows are coupled: a full 7df window costs ~50%
+# of 7d, so per account
 #   rem7df_eff = min(rem7df, 2 * rem7d)
+# (no 5h window since 2026-11: a five_hour an older daemon sends is not read)
 # A cold (never-used) account has null windows => 100% remaining.
 # auth-failed and operator-paused accounts serve nothing: excluded from
 # both the sums and the (N) count.
-# Output: "<daemon port>\037cl_n cl5 cl7 clf cl_rs cx_n cx7 cx_rs".
+# Output: "<daemon port>\037cl_n cl7 clf cl_rs cx_n cx7 cx_rs".
 JQ_FLEET='
 def s: (if type == "string" then . else tojson end) | split("\u0000") | join("");
 def c01: if . < 0 then 0 elif . > 1 then 1 else . end;
@@ -580,15 +582,12 @@ def usable: select(.status != "auth_failed" and .blocked != "paused");
   | [.accounts[] | select(.group == "codex") | usable] as $cx
   | [ $cl[]
       | ((.seven_day.utilization    // 0) | c01) as $u7
-      | ((.five_hour.utilization    // 0) | c01) as $u5
       | ((.fable_weekly.utilization // 0) | c01) as $uf
       | (1 - $u7) as $r7
-      | { r5: (([ (1 - $u5), (5 * $r7) ] | min) * 100),
-          r7: ($r7 * 100),
+      | { r7: ($r7 * 100),
           rf: (([ (1 - $uf), (2 * $r7) ] | min) * 100) }
     ] as $rem
   | [ ($cl | length),
-      ([$rem[].r5] | add // 0 | round),
       ([$rem[].r7] | add // 0 | round),
       ([$rem[].rf] | add // 0 | round),
       (([$cl[].seven_day.resets_in_secs] | map(select(. != null)) | min) // "-"),
@@ -632,7 +631,7 @@ rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read
       [ "$daemon_port" = "$url_port" ] || fleet_tuple=""
     fi
     if [ -n "$fleet_tuple" ]; then
-      read -r cl_n cl5 cl7 clf cl_rs cx_n cx7 cx_rs <<< "$fleet_tuple"
+      read -r cl_n cl7 clf cl_rs cx_n cx7 cx_rs <<< "$fleet_tuple"
       # A cached answer is C_AGE seconds old: move its countdowns forward.
       if [ "$C_AGE" -gt 0 ]; then
         is_int "${cl_rs:-}" && cl_rs=$((cl_rs - C_AGE))
@@ -640,11 +639,10 @@ rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read
       fi
       if [ -n "${cl_n:-}" ]; then
         if [ "$cl_n" -gt 0 ] 2>/dev/null; then
-          pct_paint "$cl5" "$cl_n"; c5="$PC"
           pct_paint "$cl7" "$cl_n"; c7="$PC"
           pct_paint "$clf" "$cl_n"; cf="$PC"
           reset_span "${cl_rs:-}"
-          rate_seg="${MAGENTA}CLD(${cl_n})${RESET} ${DIM}5h:${RESET} ${c5}${cl5}%${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}${RS}"
+          rate_seg="${MAGENTA}CLD(${cl_n})${RESET} ${DIM}7d:${RESET} ${c7}${cl7}%${RESET} ${DIM}7df:${RESET} ${cf}${clf}%${RESET}${RS}"
         fi
         if [ "$cx_n" -gt 0 ] 2>/dev/null; then
           pct_paint "$cx7" "$cx_n"
@@ -656,12 +654,12 @@ rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read
     fi
   fi
   # Fallback (no llmux, daemon down, port mismatch, parse failure): the
-  # session's own windows as reported by Claude Code, in REMAINING terms with
-  # the same coupling cap (rem5h_eff = min(rem5h, 5*rem7d)). The harness
-  # currently reports only five_hour and seven_day; a fable weekly window is
-  # picked up automatically if it ever appears. Never an error.
+  # session's own weekly window as reported by Claude Code, in REMAINING
+  # terms; a fable weekly window is picked up automatically if it ever
+  # appears, with the same coupling cap (rem7df_eff = min(rem7df, 2*rem7d)).
+  # A five_hour the harness may still send is not read. Never an error.
   if [ -z "$rate_seg" ]; then
-    read -r u5 r5at u7 r7at uf <<< "$rl_tuple"
+    read -r u7 r7at uf <<< "$rl_tuple"
     rem7=""
     if [ -n "${u7:-}" ] && [ "$u7" != "-" ]; then
       if [ "$j_rem7" = "?" ]; then
@@ -671,21 +669,6 @@ rate_segment() { # [force] -> rate_seg, FLEET_TS (when the fleet answer was read
       fi
     fi
     parts=()
-    if [ -n "${u5:-}" ] && [ "$u5" != "-" ]; then
-      if [ "$j_rem7" = "?" ]; then
-        rem5=$(exec awk -v u="$u5" -v r7="${rem7:-100}" 'BEGIN{
-          r=100-u; if (r<0) r=0; cap=5*r7; if (r>cap) r=cap; printf "%d", r }')
-      else
-        rem5="$j_rem5"
-      fi
-      pct_paint "$rem5" 1
-      seg5="${DIM}5h:${RESET} ${PC}${rem5}%${RESET}"
-      if [ "$r5at" != "-" ] && [ -n "$r5at" ]; then
-        reset_at_span "$r5at"
-        seg5="${seg5}${RS}"
-      fi
-      parts+=("$seg5")
-    fi
     if [ -n "$rem7" ]; then
       pct_paint "$rem7" 1
       seg7="${DIM}7d:${RESET} ${PC}${rem7}%${RESET}"

@@ -36,19 +36,38 @@ expect_contains() { # $1 name, $2 haystack, $3 needle
   fi
 }
 
-# 1. The canonical spec: 3 claude accounts with 50% left on every window => 150%.
-#    (coupling caps don't bite: rem5h=50 <= 5*rem7d=250, rem7df=50 <= 2*rem7d=100)
+expect_absent() { # $1 name, $2 haystack, $3 needle that must not appear
+  if [[ "$2" != *"$3"* && "$2" != *"STDERR:"* ]]; then
+    echo "ok   $1"
+  else
+    echo "FAIL $1"; echo "  must not contain: $3"; echo "  got:              $2"; fail=1
+  fi
+}
+
+# 0. There is no 5-hour window (owner 2026-11-10; llmux #273 drops five_hour
+#    from `llmux status --json`). The fleet shows 7d and 7df only; a five_hour
+#    an older daemon still sends is ignored.
+#    no5h: a = 75 (7d) / min(50, 150) = 50 (7df), b = 50 / cold 7df min(100, 100) = 100
+out=$(run_with_fixture fixture-no5h.json)
+expect_contains "llmux #273 shape: 7d + 7df only" "$out" "CLD(2) 7d: 125% 7df: 150%"
+expect_absent   "llmux #273 shape: no 5h segment" "$out" "5h:"
+expect_contains "llmux #273 shape: codex"         "$out" "CDX(1) 7d: 90%"
 out=$(run_with_fixture fixture-fleet.json)
-expect_contains "remaining-sum 150%" "$out" "CLD(3) 5h: 150% 7d: 150% 7df: 150%"
+expect_absent   "older daemon five_hour ignored"  "$out" "5h:"
+
+# 1. The canonical spec: 3 claude accounts with 50% left on every window => 150%.
+#    (coupling cap doesn't bite: rem7df=50 <= 2*rem7d=100)
+out=$(run_with_fixture fixture-fleet.json)
+expect_contains "remaining-sum 150%" "$out" "CLD(3) 7d: 150% 7df: 150%"
 expect_contains "codex remaining"    "$out" "CDX(1) 7d: 96%"
 
 # 2. Coupling + cold:
-#    exhausted: rem7d=0  -> 5h/7df forced to 0 despite fresh windows
-#    tight7d:   rem7d=10 -> rem5h_eff=min(90,50)=50, rem7df_eff=min(100,20)=20
+#    exhausted: rem7d=0  -> 7df forced to 0 despite a fresh window
+#    tight7d:   rem7d=10 -> rem7df_eff=min(100,20)=20
 #    cold:      null windows -> 100 everywhere
-#    sums: 5h 0+50+100=150, 7d 0+10+100=110, 7df 0+20+100=120
+#    sums: 7d 0+10+100=110, 7df 0+20+100=120 (the fixture's five_hour is ignored)
 out=$(run_with_fixture fixture-coupling.json)
-expect_contains "coupling caps + cold" "$out" "CLD(3) 5h: 150% 7d: 110% 7df: 120%"
+expect_contains "coupling cap + cold" "$out" "CLD(3) 7d: 110% 7df: 120%"
 expect_contains "codex coupling fixture" "$out" "CDX(1) 7d: 75%"
 
 # 2b. Reset countdowns: soonest 7d reset among USABLE accounts per group
@@ -76,16 +95,18 @@ fi
 #  windows; the expectations above pass only if they are excluded from
 #  sums AND the (N) count)
 
-# 3. Direct mode (no llmux): the session windows in REMAINING terms with the
-#    5h coupling cap and a reset countdown on 7d.
+# 3. Direct mode (no llmux): the session's weekly window in REMAINING terms
+#    with a reset countdown on 7d; the harness's five_hour is ignored.
 DIRECT='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":58},"seven_day":{"used_percentage":45,"resets_at":RESETS}}}'
 out=$(echo "${DIRECT/RESETS/$(( $(date +%s) + 274000 ))}" \
   | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" | sed "$STRIP")
-expect_contains "direct remaining"      "$out" "5h: 42% 7d: 55% "
+expect_contains "direct remaining"      "$out" "7d: 55% "
+expect_absent   "direct: the harness's five_hour is ignored" "$out" "5h:"
 expect_contains "direct 7d countdown"   "$out" "↻3d4h"
-COUPLED='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":92}}}'
+COUPLED='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":92},"seven_day_fable":{"used_percentage":0}}}'
 out=$(echo "$COUPLED" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent bash "$SCRIPT" | sed "$STRIP")
-expect_contains "direct 5h coupling cap" "$out" "5h: 40% 7d: 8%"
+expect_contains "direct 7df coupling cap" "$out" "7d: 8% 7df: 16%"
+expect_absent   "direct: no 5h with a coupled 7d either" "$out" "5h:"
 
 # 3b. Countdown urgency/blink rules are COMMON to direct mode: <1h reset
 #     renders red and inverts on the odd wall-clock bucket, same as fleet.
@@ -94,7 +115,8 @@ out=$(echo "$DIRECT3" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LL
 expect_contains "direct blink phase on"  "$out" "${REV}"
 DIRECT4='{"model":{"display_name":"T"},"workspace":{"current_dir":"/tmp"},"rate_limits":{"five_hour":{"used_percentage":58,"resets_at":9010},"seven_day":{"used_percentage":45,"resets_at":100010}}}'
 out=$(echo "$DIRECT4" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LLMUX_STATUSLINE_NOW=10 bash "$SCRIPT" | sed "$STRIP")
-expect_contains "direct 5h countdown" "$out" "5h: 42% ↻2h30m 7d: 55% ↻1d3h"
+expect_contains "direct 7d countdown, 5h ignored" "$out" "| 7d: 55% ↻1d3h"
+expect_absent   "direct: no 5h countdown" "$out" "5h:"
 out=$(echo "$DIRECT3" | ANTHROPIC_BASE_URL= LLMUX_STATUSLINE_BIN=/nonexistent LLMUX_STATUSLINE_NOW=10 bash "$SCRIPT" | sed "$STRIP")
 expect_contains "direct <1h format"      "$out" "↻17m10s"
 
@@ -123,7 +145,7 @@ run_cached() { # $1 = NOW -> stripped line; stderr must stay empty
 }
 calls() { wc -l < "$COUNTER" | tr -d ' '; }
 fleet_file() { local f; for f in "$CD"/fleet-*; do case "$f" in *.lock|*.tmp.*) ;; *) printf '%s' "$f" ;; esac; done; }
-FLEET="CLD(3) 5h: 150% 7d: 110% 7df: 120%"
+FLEET="CLD(3) 7d: 110% 7df: 120%"
 
 out=$(run_cached 1000)
 expect_contains "cache miss renders fleet"   "$out" "$FLEET ↻17h10m"
@@ -213,7 +235,7 @@ stamp() { sed "1s/.*/$1/" "$f" > "$f.t" && mv "$f.t" "$f"; } # entry with data r
 put_entry() { # $1 = ts, $2 = summary tuple: a valid entry with other data
   { echo "$1"; sed -n '2,4p' "$f"; echo "$2"; echo end; } > "$f.t" && mv "$f.t" "$f"
 }
-OTHER="9 900 900 900 61800 1 75 1030"
+OTHER="9 900 900 61800 1 75 1030"
 
 # (a) Equal data time (same second): the lock breaks the tie. The holder
 #     publishes over an entry stamped the same second; a run whose lock was
@@ -370,7 +392,7 @@ wait_for "$JQSIG/started"
 sleep 2
 lk=$(ls -d "$CD"/fleet-*.lock); f="${lk%.lock}"
 T1=$(date +%s)
-printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$T1" llmux-statusline-fleet-v1 "$FS2|local" 3456 "$OTHER" end > "$f.new" && mv "$f.new" "$f"
+printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$T1" llmux-statusline-fleet-v2 "$FS2|local" 3456 "$OTHER" end > "$f.new" && mv "$f.new" "$f"
 : > "$JQSIG/go"; wait "$pid" || true
 expect_eq "real clock: lock holder with older data keeps the newer entry" "$(head -n 1 "$f")|$(sed -n 5p "$f")" "$T1|$OTHER"
 expect_eq "real clock: lock holder released its lock, dropped its staging" "$(ls "$CD" | grep -c '\.lock$\|\.tmp\.')" 0
@@ -469,9 +491,9 @@ run_path() { # $1 = dir first on PATH
     LLMUX_STATUSLINE_NOW=7000 LLMUX_STATUSLINE_CACHE_DIR="$CD" bash "$SCRIPT" 2>"$err" | sed "$STRIP"
   if [ -s "$err" ]; then echo "STDERR: $(cat "$err")"; fi
 }
-expect_contains "llmux resolved in dir A: A's fleet"           "$(run_path "$DA")" "CLD(3) 5h: 150% 7d: 150% 7df: 150%"
+expect_contains "llmux resolved in dir A: A's fleet"           "$(run_path "$DA")" "CLD(3) 7d: 150% 7df: 150%"
 expect_contains "llmux resolved in dir B: B's fleet, not A's"  "$(run_path "$DB")" "$FLEET"
-expect_contains "llmux resolved in dir A again: A's (cached)"  "$(run_path "$DA")" "CLD(3) 5h: 150% 7d: 150% 7df: 150%"
+expect_contains "llmux resolved in dir A again: A's (cached)"  "$(run_path "$DA")" "CLD(3) 7d: 150% 7df: 150%"
 expect_eq       "two resolutions: two fleet entries" "$(ls "$CD" | grep -c '^fleet-[0-9]*$')" 2
 
 # The fleet entry is stamped when llmux answered, not when the run started
@@ -650,8 +672,8 @@ run5() { # $1 = PATH prefix ("" = none)
 entry_of() { local e; for e in "$CD/$1"-*; do case "$e" in *.lock|*.tmp.*) ;; *) printf '%s' "$e" ;; esac; done; }
 aged_by() { sed "1s/.*/$(( $(date +%s) - $2 ))/" "$1" > "$1.t" && mv "$1.t" "$1"; } # entry, seconds
 live_lock() { rm -rf "$1.lock"; mkdir "$1.lock"; printf '%s.1.1\n' "$(date +%s)" > "$1.lock/owner"; }
-COUP_SUMS="CLD(3) 5h: 150% 7d: 110% 7df: 120%"
-FLEET_SUMS="CLD(3) 5h: 150% 7d: 150% 7df: 150%"
+COUP_SUMS="CLD(3) 7d: 110% 7df: 120%"
+FLEET_SUMS="CLD(3) 7d: 150% 7df: 150%"
 
 # (a) git: a hit. fleet: 4 s old (stale), another run holds its lock, so it
 #     is served from the cache; the 3 s render pushes it past 6 s. Its forced
